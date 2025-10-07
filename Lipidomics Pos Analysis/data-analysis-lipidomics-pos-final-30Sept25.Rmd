@@ -1,0 +1,3005 @@
+---
+title: "blood plasma lipidomics - Data analysis (+)"
+author: "Maria Sholola"
+date: "2024-06-03 and so on"
+output: 
+  html_document:
+    highlight: kate
+    theme: yeti
+    toc: true
+    toc_float: true
+    toc_depth: 5
+    code_download: true
+    fig_width: 7
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo=TRUE) 
+```
+
+# Load libraries
+
+```{r, warning = FALSE, message = FALSE}
+
+library(readxl) # for reading in excel files
+library(janitor) # data checks and cleaning
+library(glue) # for easy pasting
+library(FactoMineR) # for PCA
+library(factoextra) # for PCA
+library(rstatix) # for stats
+library(pheatmap) # for heatmaps
+library(plotly) # for interactive plots
+library(htmlwidgets) # for saving interactive plots
+library(devtools)
+library(notame) # used for feature clustering
+library(doParallel)
+library(igraph) # feature clustering
+library(ggpubr) # visualizations
+library(knitr) # clean table printing
+library(rmarkdown)
+library(corrr)
+library(ggcorrplot)
+library(ggthemes)
+library(ggtext)
+library(PCAtools)
+library(pathview) # for functional analysis and KEGG annotation
+library(mixOmics) #multilevel PCA and sPLS-DA
+library(lipidr)
+library(patchwork)
+library(tidyverse) # for everything
+```
+
+# Read in data
+
+```{r}
+# raw filtered metabolomics data 
+omicsdata <- read_csv("features_post-data-filtering.csv") %>%
+  clean_names()
+
+# metadata
+metadata <- read_csv("../../../metadata-new.csv")
+
+# carotenoids data
+carotenoids <- read_excel("../../../Plasma carot_ret_apo levels.xlsx",
+                          sheet = "B1andB3") %>%
+  clean_names()
+```
+
+# Wrangle data
+
+## Metadata
+
+```{r}
+carotenoids <- carotenoids %>%
+  mutate(total_carotenoids = b_c_nmol_l_plasma + lyc_nmol_l_plasma + retinol_nmol_l_plasma + apo13one_nmol_l_plasma)
+```
+
+## Feature data
+
+```{r}
+# how many features
+nrow(omicsdata)
+```
+
+```{r}
+# are there any duplicates?
+omicsdata %>% get_dupes(mz_rt)
+```
+
+```{r}
+# remove dupes
+omicsdata <- omicsdata %>% 
+  distinct(mz_rt, .keep_all = TRUE)
+
+# check again for dupes
+omicsdata %>% get_dupes(mz_rt)
+
+# how many features
+nrow(omicsdata)
+```
+
+Sometimes a weird logical column (lgl) comes up in my data. Let's check if it's there
+
+```{r}
+colnames(omicsdata)
+```
+
+```{r}
+# remove lgl column
+omicsdata <- omicsdata %>%
+  dplyr::select(!where(is.logical)) 
+
+colnames(omicsdata)
+```
+
+### Tidy
+
+```{r}
+# create long df for omics df
+omicsdata_tidy <- omicsdata %>%
+  pivot_longer(cols = 3:ncol(.),
+               names_to = "sample",
+               values_to = "peak_height") %>%
+  mutate(sample2 = sample) %>%
+  # add a new column with just subject
+  dplyr::rename("subject" = sample2) %>%
+  # remove the suffix from subject names
+  mutate_at("subject", str_sub, start=2, end=5)
+  
+```
+
+## Combine dfs
+
+```{r, echo=FALSE}
+metadata$subject <- as.character(metadata$subject)
+
+# combine meta and omics dfs
+meta_omics <- full_join(omicsdata_tidy,
+                         metadata,
+                         by = "subject")
+
+# separate mz and rt
+meta_omics_sep <- meta_omics %>%
+  separate(col = mz_rt,
+           into = c("mz", "rt"),
+           sep = "_") 
+
+# convert columns to correct type
+meta_omics_sep$mz <- as.numeric(meta_omics_sep$mz)
+meta_omics_sep$rt <- as.numeric(meta_omics_sep$rt)
+meta_omics_sep$subject <- as.character(meta_omics_sep$subject)
+
+# rearrange column order
+meta_omics_sep <- meta_omics_sep %>%
+  dplyr::select(subject, sample, treatment, tomato_or_control, everything())
+
+str(meta_omics_sep)
+```
+
+```{r}
+# replace NA's in certain columns with QC
+meta_omics_sep$subject <- str_replace_all(meta_omics_sep$subject, "c", "qc")
+  
+
+meta_omics_sep$sample <- meta_omics_sep$sample %>%
+  replace_na("QC")
+
+meta_omics_sep$treatment <- meta_omics_sep$treatment %>%
+  replace_na("QC")
+
+meta_omics_sep$tomato_or_control <- meta_omics_sep$tomato_or_control %>%
+  replace_na("QC")
+```
+
+# Data summaries
+
+## Number of masses detected
+
+```{r}
+nrow(omicsdata)
+```
+
+## Mass range for metabolites detected?
+
+```{r}
+range(meta_omics_sep$mz)
+```
+
+## RT range for metabolites detected?
+
+```{r}
+range(meta_omics_sep$rt)
+```
+
+## Mass vs RT scatterplot
+
+```{r}
+# plot
+(plot_mzvsrt <- meta_omics_sep %>%
+  ggplot(aes(x = rt, y = mz)) +
+  geom_point() +
+  theme_minimal() +
+  labs(x = "Retention time, min",
+       y = "m/z",
+       title = "mz across RT for all features"))
+```
+
+## Histogram for mass range
+
+```{r}
+meta_omics_sep %>%
+  group_by(mz) %>%
+  ggplot(aes(x = mz)) +
+  geom_histogram(binwidth = 25) +
+  theme_minimal() +
+  labs(x = "Monoisotopic mass (amu)",
+       y = "Number of features",
+       title = "Distribution of features by mass")
+```
+
+## Histogram for RT
+
+```{r}
+meta_omics_sep %>%
+  group_by(mz) %>%
+  ggplot(aes(x = rt)) +
+  geom_histogram(binwidth = 0.1) + # 6 second bins
+  theme_minimal() +
+  labs(x = "Retention time",
+       y = "Number of features",
+       title = "Distribution of features by retention time")
+```
+
+# NAs and imputing
+
+## NAs
+
+```{r}
+# samples only (no QCs)
+omicsdata_noQC <- omicsdata %>%
+  dplyr::select(-contains("qc"))
+
+#NAs in samples only?
+NAbyRow_noQC <- rowSums(is.na(omicsdata_noQC[,-1]))
+
+hist(NAbyRow_noQC,
+     breaks = 70, # because there are 70 samples 
+     xlab = "Number of missing values",
+     ylab = "Number of metabolites",
+     main = "How many missing values are there?")
+```
+
+Are there any missing values in QCs? There shouldn't be after data preprocessing/filtering
+
+```{r}
+omicsdata_QC <- omicsdata %>%
+  dplyr::select(starts_with("qc")) 
+
+NAbyRow_QC <- colSums(is.na(omicsdata_QC))
+# lets confirm that there are no missing values from my QCs
+sum(NAbyRow_QC) # no
+```
+
+```{r}
+# calculate how many NAs there are per feature in whole data set
+contains_NAs <- meta_omics %>%
+  group_by(mz_rt) %>%
+  dplyr::count(is.na(peak_height)) %>%
+  filter(`is.na(peak_height)` == TRUE)
+kable(contains_NAs)
+```
+
+## Remove NAs
+
+There are some features that are missing in a majority of subjects. I'm going to remove those because they may skew the data.
+
+```{r}
+# number of features
+nrow(omicsdata)
+
+# Removing features missing from over 90% of data
+omit_features <- contains_NAs %>%
+  filter(n/70 >= 0.90)
+
+#preview
+nrow(omit_features) # features to remove
+
+# how many features should be left?
+nrow(omicsdata) - nrow(omit_features)
+
+# now remove these features from the omics dataset
+omicsdata <- omicsdata %>%
+  anti_join(omit_features,
+            by = "mz_rt")
+
+ # check number of features now?
+nrow(omicsdata)
+```
+
+## Data imputation
+
+```{r}
+# impute any missing values by replacing them with 1/2 of the lowest peak height value of a feature (i.e. in a row).
+imputed_omicsdata <- omicsdata
+
+imputed_omicsdata[] <- lapply(imputed_omicsdata, 
+                              function(x) ifelse(is.na(x),
+                                                 min(x, na.rm = TRUE)/2, x))
+
+dim(imputed_omicsdata)
+```
+
+Are there any NAs?
+
+```{r}
+imputed_omicsdata %>%
+  is.na() %>%
+  sum()
+
+# imputations worked
+```
+
+# New tidy df
+
+```{r}
+# create long df for imputed omics df
+imputed_omicsdata_tidy <- imputed_omicsdata %>%
+  pivot_longer(cols = 3:ncol(.),
+               names_to = "sample",
+               values_to = "peak_height") %>%
+  mutate(sample2 = sample) %>%
+  # add a new column with just subject
+  dplyr::rename("subject" = sample2) %>%
+  # remove the suffix from subject names
+  mutate_at("subject", str_sub, start=2, end=5) 
+
+# combine meta and imputed omics dfs
+imp_meta_omics <- full_join(imputed_omicsdata_tidy,
+                         metadata,
+                         by = c("subject" = "subject"))
+```
+
+```{r}
+# separate mz and rt
+imp_meta_omics_sep <- imp_meta_omics %>%
+  separate(col = mz_rt,
+           into = c("mz", "rt"),
+           sep = "_") 
+
+# convert columns to correct type
+imp_meta_omics_sep$mz <- as.numeric(imp_meta_omics_sep$mz)
+imp_meta_omics_sep$rt <- as.numeric(imp_meta_omics_sep$rt)
+
+```
+
+# Notame feature reduction
+
+vignette for reference
+
+```{r}
+#browseVignettes("notame")
+```
+
+Let's look at what masses come up at each RT again
+
+```{r}
+# rt vs mz plot
+imp_meta_omics_sep %>%
+  ggplot(aes(x = rt, y = mz)) +
+  geom_point() +
+  theme_minimal() +
+  labs(x = "RT (min)",
+       y = "mz")
+```
+
+There are some points that are at the same RT, meaning they could be coming from the same compound. We'll run notame clustering to collapse features coming from one mass into one feature.
+
+## Data restructuring for notame
+
+```{r}
+# create features list from imputed data set to only include unique feature ID's (mz_rt), mz and RT
+features <- imp_meta_omics_sep %>%
+  cbind(imp_meta_omics$mz_rt) %>%
+  dplyr::rename("mz_rt" = "imp_meta_omics$mz_rt") %>%
+  dplyr::select(c(mz_rt, mz, rt)) %>%
+  distinct() # remove the duplicate rows
+
+# create a second data frame which is just imp_meta_omics restructured to another wide format
+data_notame <- data.frame(imputed_omicsdata %>%
+                            dplyr::select(-row_id) %>%
+                            t())
+
+data_notame <- data_notame %>%
+  tibble::rownames_to_column() %>% # change samples from rownames to its own column
+  row_to_names(row_number = 1) # change the feature IDs (mz_rt) from first row obs into column names
+```
+
+Check structures
+
+```{r}
+# check if mz and rt are numeric
+str(features)
+```
+
+```{r}
+# check if results are numeric
+head(data_notame, n = 1)
+
+# change to results to numeric
+data_notame <- data_notame %>%
+  mutate_at(-1, as.numeric)
+
+head(data_notame, n = 1)
+```
+
+## Find connections
+
+```{r}
+connection <- find_connections(data = data_notame,
+                               features = features,
+                               corr_thresh = 0.95,
+                               rt_window = 1/60,
+                               name_col = "mz_rt",
+                               mz_col = "mz",
+                               rt_col = "rt")
+
+head(connection)
+```
+
+## Clustering
+
+```{r}
+clusters <- find_clusters(connections = connection, d_thresh = 0.8)
+```
+
+```{r}
+# assign a cluster ID to all features. Clusters are named after feature with highest median peak height
+features_clustered <- assign_cluster_id(data_notame, clusters, features, name_col = "mz_rt")
+
+# lets see how many features are removed when we only keep one feature per cluster
+pulled <- pull_clusters(data_notame, features_clustered, name_col = "mz_rt")
+cluster_data <- pulled$cdata
+cluster_features <- pulled$cfeatures
+
+# how much did we trim our data down by?
+nrow(omicsdata) - nrow(cluster_features)
+
+```
+
+```{r}
+# export clustered feature list
+write_csv(cluster_features,
+          "Notame/notame-clustered-features.csv")
+
+```
+
+## Reduce dataset based on clustering
+
+```{r}
+# transpose the full dataset back to wide so that it is more similar to the notame dataset
+imp_meta_omics_wide <- imp_meta_omics %>%
+  dplyr::select(-"row_id") %>%
+  pivot_wider(names_from = mz_rt,
+              values_from = peak_height)
+
+# list of reduced features
+clusternames <- cluster_features$mz_rt
+
+# select only the features are in the reduced list
+imp_clust <- imp_meta_omics_wide[,c(names(imp_meta_omics_wide) %in% clusternames)]
+
+# bind back sample names
+imp_clust <- cbind(imp_meta_omics_wide[1], imp_clust)
+
+tibble(imp_clust)
+
+```
+
+## New mz vs rt plot
+
+Let's see how our clustered data looks now compared to the original
+
+```{r}
+# plot new rt vs mz scatterplot post-clustering
+(plot_mzvsrt_postcluster <- cluster_features %>%
+  ggplot(aes(x = rt,
+             y = mz)) +
+  geom_point() +
+  theme_minimal() +
+  labs(x = "Retention time, min",
+       y = "m/z, neutral",
+       title = "mz across RT for all features after clustering"))
+
+
+```
+
+```{r, fig.height=10, fig.asp=1}
+# plot both scatterplots to compare with and without notame clustering
+(scatterplots <- ggarrange(plot_mzvsrt, 
+                           plot_mzvsrt_postcluster, 
+                           nrow = 2))
+```
+
+# Wrangle new data
+
+```{r}
+# add subject column back for a seamless join with metadata
+imp_clust$subject <- imp_meta_omics_wide$subject
+
+# bind back new clustered data with metadata
+imp_metabind_clust <- right_join(metadata, 
+                                 imp_clust,
+                                 by = "subject")
+```
+
+# Visualize untransformed data
+
+## More wrangling
+
+```{r}
+# meta data columns 
+str_meta <- colnames(imp_metabind_clust[,4:13])
+
+# change meta data columns to character so that I can change NAs from QCs to "QC"
+imp_metabind_clust <- imp_metabind_clust %>%
+  mutate_at(str_meta, as.character) 
+
+# replace NAs in metadata columns for QCs
+imp_metabind_clust[is.na(imp_metabind_clust)] <- "QC"
+
+# long df
+imp_metabind_clust_tidy <- imp_metabind_clust %>%
+  pivot_longer(cols = 15:ncol(.),
+               names_to = "mz_rt",
+               values_to = "rel_abund")
+
+# structure check
+head(imp_metabind_clust_tidy)
+```
+
+## Boxplot
+
+```{r}
+imp_metabind_clust_tidy %>%
+  ggplot(aes(x = subject, y = rel_abund, color = treatment)) +
+  geom_boxplot(alpha = 0.6) +
+  scale_color_manual(values = c("orange", "lightgreen", "gray", "tomato1")) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  labs(title = "LC-MS (+) Feature Abundances by Sample",
+       subtitle = "Unscaled data",
+       y = "Relative abundance")
+```
+
+Will need to log transform in order to normalize and actually see the data
+
+# Log2 transform
+
+```{r}
+imp_metabind_clust_tidy_log2 <- imp_metabind_clust_tidy %>%
+  mutate(rel_abund_log2 = log2(rel_abund))
+```
+
+## Boxplot
+
+```{r, fig.width=10}
+(bp_data_quality <- imp_metabind_clust_tidy_log2 %>%
+  ggplot(aes(x = sample, y = rel_abund_log2, color = treatment)) +
+  geom_boxplot(alpha = 0.6) +
+  scale_color_manual(values = c("orange", "lightgreen", "gray", "tomato1")) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  labs(title = "LC-MS (+) Feature Abundances by Sample",
+       subtitle = "Log2 transformed data",
+       y = "Relative abundance"))
+```
+
+# Notame drift correction
+
+## Data wrangling
+
+### Feature abund df
+
+```{r}
+# filtered and imputed data after notame clustering, transposed
+features_forQCcorr <- imp_clust %>%
+  dplyr::select(!subject) %>%
+  t() %>%
+  as.data.frame() %>%
+  row_to_names(row_number = "find_header")
+
+# log2 transform
+log2_features_forQCcorr <- features_forQCcorr %>%
+  mutate_all(as.numeric) %>%
+  log2()
+
+# write csv to manually edit
+write.csv(log2_features_forQCcorr,
+          "Notame/feaures_fromR_forDC_1.csv",
+          row.names = TRUE)
+```
+
+Import corrected df (edited so that "mz_rt" could be the row name for row 1)
+
+```{r}
+
+log2_features_forQCcorr_new <- read.csv("Notame/feaures_forR_forDC_editedmzrt_2.csv",
+                                header = FALSE,
+                                row.names = 1)
+
+
+log2_features_forQCcorr_new <- log2_features_forQCcorr_new %>%
+  rownames_to_column(var = "mz_rt") %>%
+  row_to_names(row_number = 1) %>%
+  separate(col = mz_rt,
+           into = c("mz", "rt"),
+           sep = "_")
+
+write.csv(log2_features_forQCcorr_new,
+          "Notame/features_fromR_forDC_3.csv",
+          row.names = TRUE)
+
+```
+
+### Pheno df
+
+```{r}
+# separate sampleID and injection order
+pheno_data <- imp_clust[1] %>%
+  separate(col = sample,
+           into = c("sample", "injection_order"),
+           # last underscore
+           sep = "_(?!.*_)")
+
+
+
+# make inj order column numeric
+pheno_data <- pheno_data %>%
+  mutate_at("injection_order", as.numeric)
+
+t_pheno_data <- as.data.frame(t(pheno_data))
+
+write.csv(t_pheno_data,
+          "Notame/pheno_df.csv",
+          row.names = TRUE)
+```
+
+Combine pheno and feature dfs manually in excel to create metaboset df.
+
+xf## Import Metaboset
+
+```{r}
+
+#make sure when converting csv to xlsx that you save as a new file, don't just change the name of the file
+metaboset <- read_from_excel("Notame/metaboset.xlsx",
+                             split_by = c("column", "Ion mode"))
+
+```
+
+```{r}
+#construct Metaboset
+modes <- construct_metabosets(exprs = metaboset$exprs,
+                              pheno_data = metaboset$pheno_data,
+                              feature_data = metaboset$feature_data, group_col = "Class")
+
+#extract each mode into a single object
+mode <- modes$C18_pos
+```
+
+## Boxplots before correction
+
+```{r, fig.width=10}
+# ordered by injection
+(qualityBPs_b4correction <- plot_sample_boxplots(mode, order_by = c("Class", "Injection_order"), title = "Uncorrected feature abundance"))
+
+#ordered by class
+plot_sample_boxplots(mode, order_by = "Injection_order", title = "Uncorrected feature abundance")
+```
+
+## Boxplots after QC drift correction
+
+drift correction takes up to 2 minutes
+
+```{r}
+mode <- flag_detection(mode, qc_limit = 0.75, group_limit = 0.8)
+
+
+corrected <- correct_drift(mode, log_transform = FALSE)
+```
+
+### Did drift correction work?
+
+output is percent of the features that were drift corrected. The remaining "low-quality" percent represents features for which the DC did *not* improve the RSD and D-ratio of the original data.
+
+```{r}
+inspected <- inspect_dc(orig = mode, dc = corrected, check_quality = TRUE)
+```
+
+### Boxplots, corrected
+
+```{r, fig.width=10}
+
+(qualityBPS_driftcorrection <- plot_sample_boxplots(corrected, order_by = c("Class", "Injection_order"), title = "Corrected feature abundance"))
+
+plot_sample_boxplots(corrected, order_by = "Injection_order", title = "Corrected feature abundance")
+```
+
+## Compare quality BPs
+
+```{r, fig.height=10, fig.width=8}
+(qualityBPs_compared <- ggarrange(qualityBPs_b4correction, qualityBPS_driftcorrection,
+                    ncol = 1, nrow = 2))
+
+
+```
+
+## Export new Metaboset to Excel spreadsheet
+
+```{r eval = FALSE}
+write_to_excel(corrected, "Notame/metaboset_corrected.xlsx")
+```
+
+Manually edit the df so it only has mass, rt, and sample columns
+
+## Import edited Metaboset
+
+```{r}
+metabdata_corrected <- read.csv(file = "Notame/metaboset_corrected_editedforR.csv",
+                                check.names = FALSE)
+```
+
+## Wrangle new metab data
+
+### Combine mz & rt back together
+
+```{r}
+metabdata_corrected_MZ_RT <- metabdata_corrected %>%
+  mutate(mass = round(metabdata_corrected$mass, digits = 4), # Decrease number of decimals for m/z & rt
+         rt = round(metabdata_corrected$rt, digits = 3),
+         .before=1,
+         .keep="unused") %>%
+  unite(mz_rt, c(mass, rt), remove=TRUE) # Combine m/z & rt with _ in between
+
+```
+
+### Transpose new df
+
+```{r}
+metabdata_corrected_t <- as.data.frame(t(metabdata_corrected_MZ_RT)) %>%
+  row_to_names(row_number = "find_header") %>% # make MZ_RT column names
+  rownames_to_column(var = "sample") # change rownames to column 1
+  
+```
+
+### Bind new data with metadata
+
+I want the new "metabdata_corrected_t" df to look just like "imp_metabind_clust_log2" df
+
+```{r}
+# go back to wide data
+imp_metabind_clust_log2 <- imp_metabind_clust_tidy_log2 %>%
+  dplyr::select(!rel_abund) %>%
+  pivot_wider(names_from = mz_rt,
+              values_from = rel_abund_log2)
+```
+
+```{r}
+
+# bind metadata columns to the new drift corrected df
+DC_imp_metabind_clust_log2 <- full_join(imp_metabind_clust_log2[,c(1:14)], 
+                                        metabdata_corrected_t, 
+                                        by = "sample")
+
+# fix QC subject names
+DC_imp_metabind_clust_log2$subject <- str_replace_all(DC_imp_metabind_clust_log2$subject, "c", "qc")
+
+DC_imp_metabind_clust_log2 <- DC_imp_metabind_clust_log2 %>%
+  mutate_at("subject", str_sub, start=1, end=4)
+
+
+# make feature abundances numeric
+DC_imp_metabind_clust_log2 <- DC_imp_metabind_clust_log2 %>%
+  mutate_at(15:ncol(.), as.numeric)
+  
+```
+
+
+# PCAs
+
+## With QCS
+
+### Wrangle
+
+```{r}
+
+PCA.DC_imp_metabind_clust_log2 <- PCA(DC_imp_metabind_clust_log2,  # wide data
+                                   quali.sup = 1:14, # remove qualitative variables
+                                   graph = FALSE, # don't graph
+                                   scale.unit = FALSE) # don't scale, already transformed data
+
+# PCA summary
+kable(summary(PCA.DC_imp_metabind_clust_log2))
+```
+
+```{r}
+# pull PC coordinates into df
+PC_coord_QC_log2 <- as.data.frame(PCA.DC_imp_metabind_clust_log2$ind$coord)
+
+# bind back metadata from cols 1-14
+PC_coord_QC_log2 <- bind_cols(DC_imp_metabind_clust_log2[,1:14], PC_coord_QC_log2)
+
+# grab some variance explained
+importance_QC <- PCA.DC_imp_metabind_clust_log2$eig
+
+# set variance explained with PC1, round to 2 digits
+PC1_withQC <- round(importance_QC[1,2], 2)
+
+# set variance explained with PC2, round to 2 digits
+PC2_withQC <- round(importance_QC[2,2], 2)
+```
+
+### Plots
+
+Using FactoExtra package
+
+```{r}
+# scree plot
+fviz_eig(PCA.DC_imp_metabind_clust_log2)
+
+# get eigenvalues
+kable(get_eig(PCA.DC_imp_metabind_clust_log2))
+```
+
+```{r}
+# scores plot
+fviz_pca_ind(PCA.DC_imp_metabind_clust_log2)
+```
+
+### Manual scores plot
+
+```{r}
+# manual scores plot
+(PCA_withQCs <- PC_coord_QC_log2 %>%
+  ggplot(aes(x = Dim.1, y = Dim.2,
+             fill = factor(treatment, levels = c("control", "beta", "red", "QC")),
+             text = sample)) +
+  geom_point(shape = 21, alpha = 0.8) +
+  scale_fill_manual(values = c("lightgreen", "orange", "tomato", "lightgray")) +
+  scale_color_manual(values = "black") +  
+  theme_minimal() +
+  coord_fixed(PC2_withQC/PC1_withQC) +
+  labs(x = glue::glue("PC1: {PC1_withQC}%"),
+       y = glue::glue("PC2: {PC2_withQC}%"),
+       fill = "Group",
+       title = "Principal Components Analysis Scores Plot",
+       subtitle = "Log2 transformed data"))
+
+ggplotly(PCA_withQCs, tooltip = "text")
+```
+
+## Without QCs
+
+### Wrangle
+
+```{r}
+DC_imp_metabind_clust_log2_noQCs <- DC_imp_metabind_clust_log2 %>%
+  filter(treatment != "QC")
+
+PCA.DC_imp_metabind_clust_log2_noQCs <- PCA(DC_imp_metabind_clust_log2_noQCs, # wide data
+                               quali.sup=1:14, # remove qualitative variables
+                               graph=FALSE, # don't graph
+                               scale.unit=FALSE) # don't scale, we already did this
+
+# look at summary
+kable(summary(PCA.DC_imp_metabind_clust_log2_noQCs))
+```
+
+```{r}
+# pull PC coordinates into df
+PC_coord_noQCs_log2 <- as.data.frame(PCA.DC_imp_metabind_clust_log2_noQCs$ind$coord)
+
+# bind back metadata from cols 1-14
+PC_coord_noQCs_log2 <- bind_cols(DC_imp_metabind_clust_log2_noQCs[,1:14], PC_coord_noQCs_log2)
+
+# grab some variance explained
+importance_noQC <- PCA.DC_imp_metabind_clust_log2_noQCs$eig
+
+# set variance explained with PC1, round to 2 digits
+PC1_noQC <- round(importance_noQC[1,2], 2)
+
+# set variance explained with PC2, round to 2 digits
+PC2_noQC <- round(importance_noQC[2,2], 2)
+```
+
+### Plots
+
+Using FactoExtra
+
+```{r}
+# scree plot
+fviz_eig(PCA.DC_imp_metabind_clust_log2_noQCs)
+```
+
+```{r}
+# scores plot
+fviz_pca_ind(PCA.DC_imp_metabind_clust_log2_noQCs)
+```
+
+### Manual scores plot
+
+```{r}
+# wrangling data prior to plot for ease
+PC_coord_noQCs_log2 <- PC_coord_noQCs_log2 %>%
+  mutate(sample2 = sample) %>%
+  mutate_at("sample2", str_sub, start=7, end=8) %>%
+  mutate(period = sample2) %>%
+  unite(treatment_period, "treatment", "period", sep = "_", remove = FALSE) %>%
+  dplyr::select(!sample2) %>%
+  mutate_at("period", as.factor) %>%
+  # relevel factors
+  mutate(treatment_period = fct_relevel(treatment_period, c("control_b1", "control_b3", 
+                                                            "beta_b1", "beta_b3",
+                                                            "red_b1", "red_b3")),
+         treatment = fct_relevel(treatment, c("control", "beta", "red")))
+```
+
+```{r}
+(PCA_withoutQCs <- PC_coord_noQCs_log2 %>%
+   ggplot(aes(x = Dim.1, y = Dim.2,
+             fill = treatment_period,
+             text = sample)) +
+   geom_point(shape = 21, alpha = 0.8) +
+   geom_hline(yintercept = 0, linetype = "dashed", alpha=0.5) +
+   geom_vline(xintercept = 0, linetype = "dashed", alpha=0.5) +
+  scale_fill_manual(values = c("darkseagreen2", "darkgreen", 
+                               "tan3", "orangered2",
+                               "lavenderblush3", "darkred")) +
+  scale_color_manual(values = "black") +  
+  theme_minimal() +
+  coord_fixed(PC2_noQC/PC1_noQC) +
+  labs(x = glue::glue("PC1: {PC1_noQC}%"),
+       y = glue::glue("PC2: {PC2_noQC}%"),
+       fill = "Group",
+       title = "Principal Components Analysis Scores Plot",
+       subtitle = "Log2 transformed data, No QCs"))
+ggplotly(PCA_withoutQCs, tooltip = "text")
+```
+
+### Faceted by period
+
+```{r}
+(PCA_faceted_noQCs <- PC_coord_noQCs_log2 %>%
+   ggplot(aes(x = Dim.1, y = Dim.2,
+             fill = treatment_period,
+             text = sample)) +
+   geom_point(shape = 21, alpha = 0.8) +
+   geom_hline(yintercept = 0, linetype = "dashed", alpha=0.5) +
+   geom_vline(xintercept = 0, linetype = "dashed", alpha=0.5) +
+  scale_fill_manual(values = c("darkseagreen2", "darkgreen", 
+                               "tan3", "orangered2",
+                               "lavenderblush3", "darkred")) +
+  scale_color_manual(values = "black") +  
+  theme_bw() +
+  coord_fixed(PC2_noQC/PC1_noQC) +
+  labs(x = glue::glue("PC1: {PC1_noQC}%"),
+       y = glue::glue("PC2: {PC2_noQC}%"),
+       fill = "treatment_period",
+       title = "Principal Components Analysis Scores Plot",
+       subtitle = "Log2 transformed data, No QCs") +
+  facet_wrap( ~ period) +
+   theme(strip.background = element_rect(fill="white")))
+
+ggplotly(PCA_faceted_noQCs, tooltip = "text")
+```
+
+```{r}
+PC_coord_noQCs_log2 %>%
+   ggplot(aes(x = Dim.1, y = Dim.2,
+             fill = sex,
+             text = sample)) +
+   geom_point(shape = 21, alpha = 0.8) +
+   geom_hline(yintercept = 0, linetype = "dashed", alpha=0.5) +
+   geom_vline(xintercept = 0, linetype = "dashed", alpha=0.5) +
+  scale_fill_manual(values = c("purple", "blue")) +
+  scale_color_manual(values = "black") +  
+  theme_bw() +
+  coord_fixed(PC2_noQC/PC1_noQC) +
+  labs(x = glue::glue("PC1: {PC1_noQC}%"),
+       y = glue::glue("PC2: {PC2_noQC}%"),
+       fill = "sex",
+       title = "Principal Components Analysis Scores Plot",
+       subtitle = "Log2 transformed data, No QCs") +
+  facet_wrap( ~ period) +
+   theme(strip.background = element_rect(fill="white"))
+```
+
+### Faceted by trt
+
+```{r, fig.height=3, fig.width=8}
+
+(PCA_faceted_noQCs2 <- PC_coord_noQCs_log2 %>%
+   ggplot(aes(x = Dim.1, y = Dim.2,
+             fill = treatment_period,
+             text = sample)) +
+   geom_point(shape = 21, alpha = 0.8) +
+   geom_hline(yintercept = 0, linetype = "dashed", alpha=0.5) +
+   geom_vline(xintercept = 0, linetype = "dashed", alpha=0.5) +
+  scale_fill_manual(values = c("darkseagreen2", "darkgreen", 
+                               "tan", "orangered2",
+                               "lavenderblush3", "darkred"),
+                    labels = c("pre control", "post control",
+                               "pre beta", "post beta",
+                               "pre lyc", "post lyc")) +
+  scale_color_manual(values = "black") +  
+  theme_bw() +
+  coord_fixed(PC2_noQC/PC1_noQC) +
+  labs(x = glue::glue("PC1: {PC1_noQC}%"),
+       y = glue::glue("PC2: {PC2_noQC}%"),
+       fill = "Intervention timepoint",
+       title = "Principal Components Analysis Scores Plot",
+       subtitle = "Log2 transformed data faceted by treatment group ") +
+   facet_wrap( ~ treatment))
+
+ggplotly(PCA_faceted_noQCs2, tooltip = "text")
+```
+
+Export plot
+
+```{r}
+ggsave(plot = PCA_faceted_noQCs2,
+       filename = "plots and figures/PCA-faceted-by-group-lipidomicsPOS.svg",
+       bg = "transparent",
+       height = 3,
+       width = 8)
+```
+
+```{r}
+PC_coord_noQCs_log2 %>%
+   ggplot(aes(x = Dim.1, y = Dim.2,
+             fill = sex,
+             text = sample)) +
+   geom_point(shape = 21, alpha = 0.8) +
+   geom_hline(yintercept = 0, linetype = "dashed", alpha=0.5) +
+   geom_vline(xintercept = 0, linetype = "dashed", alpha=0.5) +
+  scale_fill_manual(values = c("purple", "blue")) +
+  scale_color_manual(values = "black") +  
+  theme_bw() +
+  coord_fixed(PC2_noQC/PC1_noQC) +
+  labs(x = glue::glue("PC1: {PC1_noQC}%"),
+       y = glue::glue("PC2: {PC2_noQC}%"),
+       fill = "sex",
+       title = "Principal Components Analysis Scores Plot",
+       subtitle = "Log2 transformed data, No QCs") +
+  facet_wrap( ~ treatment) +
+   theme(strip.background = element_rect(fill="white"))
+```
+
+### Faceted by sex
+
+```{r}
+(PC_coord_facetsex <- PC_coord_noQCs_log2 %>%
+   ggplot(aes(x = Dim.1, y = Dim.2,
+             fill = treatment_period,
+             text = sample)) +
+   geom_point(shape = 21, alpha = 0.8) +
+   geom_hline(yintercept = 0, linetype = "dashed", alpha=0.5) +
+   geom_vline(xintercept = 0, linetype = "dashed", alpha=0.5) +
+  scale_fill_manual(values = c("darkseagreen2", "darkgreen", 
+                               "tan3", "orangered2",
+                               "lavenderblush3", "darkred")) +
+  scale_color_manual(values = "black") +  
+  theme_bw() +
+  coord_fixed(PC2_noQC/PC1_noQC) +
+  labs(x = glue::glue("PC1: {PC1_noQC}%"),
+       y = glue::glue("PC2: {PC2_noQC}%"),
+       fill = "sex",
+       title = "Principal Components Analysis Scores Plot",
+       subtitle = "Log2 transformed data, No QCs") +
+  facet_wrap( ~ sex) +
+   theme(strip.background = element_rect(fill="white")))
+
+ggplotly(PC_coord_facetsex, tooltip = "text")
+```
+
+# Multilevel PCA
+
+This type of PCA accounts for the structure of paired data, allowing for a more accurate assessment of biological differences between treatment groups, not differences attributed to the natural variation between individuals.
+
+See <http://mixomics.org/methods/multilevel/> for more info.
+
+## Wrangle
+
+```{r}
+
+Data_forMPCA <- DC_imp_metabind_clust_log2_noQCs %>%
+  mutate_at("subject", as.factor) %>%
+  mutate(sample2 = sample,
+         b_c = carotenoids$b_c_nmol_l_plasma,
+         lyc = carotenoids$lyc_nmol_l_plasma,
+         apo13one = carotenoids$apo13one_nmol_l_plasma,
+         retinol = carotenoids$retinol_nmol_l_plasma,
+         total_carot = carotenoids$total_carotenoids) %>%
+  mutate_at("sample2", str_sub, start=7, end=8) %>%
+  mutate(period = sample2) %>%
+  dplyr::select(c(1:14), period, b_c, lyc, apo13one, retinol, total_carot, everything()) %>%
+  dplyr::select(!sample2)
+ 
+
+summary(as.factor(Data_forMPCA$subject))
+
+# make a vector for meta variables
+(metavar <- Data_forMPCA[,c(1:20)] %>%
+    colnames())
+```
+
+## Regular PCA
+
+```{r}
+mixOmicsPCA.result <- mixOmics::pca(Data_forMPCA[,!names(Data_forMPCA) %in% metavar],
+                            scale = FALSE,
+                            center = FALSE)
+
+plotIndiv(mixOmicsPCA.result, 
+          ind.names = Data_forMPCA$subject, 
+          group = Data_forMPCA$treatment, 
+          legend = TRUE, 
+          legend.title = "Treatment", 
+          title = 'Regular PCA, Lipidomics C18 (+)')
+
+```
+
+## Multilevel PCA
+
+With all data
+
+```{r}
+multilevelPCA.result <- mixOmics::pca(Data_forMPCA[,-(c(1:20))], 
+                            multilevel = Data_forMPCA$subject,
+                            scale = FALSE,
+                            center = FALSE,ncomp = 10)
+
+plotIndiv(multilevelPCA.result, 
+          ind.names = Data_forMPCA$period, 
+          group = Data_forMPCA$treatment, 
+          legend = TRUE, 
+          legend.title = "Treatment", 
+          title = 'Multilevel PCA, Lipidomics C18 (+)',comp = c(1,2))
+
+
+```
+
+### Loadings
+
+```{r, fig.width=12, fig.height=12}
+plotLoadings(multilevelPCA.result, ndisplay = 30)
+```
+
+
+# PCAtools
+
+### Data wrangling
+
+```{r}
+# create rel abund df suitable for PCAtools package
+imp_clust_omicsdata_forPCAtools <- Data_forMPCA %>%
+  # select only sample ID and feature columns
+  dplyr::select(sample,
+                21:ncol(.)) %>%
+  # transpose
+  t() %>%
+  # convert back to df
+  as.data.frame()
+
+names(imp_clust_omicsdata_forPCAtools) <- imp_clust_omicsdata_forPCAtools[1,] # make samp;e IDs column names
+
+imp_clust_omicsdata_forPCAtools <- imp_clust_omicsdata_forPCAtools[-1,] # remove sample ID row
+
+# create metadata df suitable for PCAtools pckg
+
+metadata_forPCAtools <- Data_forMPCA[,1:20]
+
+metadata_forPCAtools <- metadata_forPCAtools %>%
+  unite("treatment_period", c("treatment", "period"), sep = "_", remove = FALSE) %>%
+  column_to_rownames("sample")
+  
+
+# create a vector so that col names in abundance df matches metadata df
+order_forPCAtools <- match(colnames(imp_clust_omicsdata_forPCAtools), rownames(metadata_forPCAtools))
+
+# reorder col names in abundance df so that it matches metadata
+log2_abundances_reordered_forPCAtools <- imp_clust_omicsdata_forPCAtools[,order_forPCAtools] %>%
+  # change abundance df to numeric
+  mutate_all(as.numeric)
+
+```
+
+### PCA
+
+#### colby trt
+
+```{r, fig.width=10, fig.height=8}
+# pca
+p <- PCAtools::pca(log2_abundances_reordered_forPCAtools,
+                   metadata = metadata_forPCAtools,
+                   scale = FALSE, # using scaled data already (log2 transformed)
+         
+)
+
+biplot(p, 
+       lab = paste0(metadata_forPCAtools$subject),
+       colby = 'treatment',
+       colkey = c("control" = "lightgreen",
+                  "beta" = "orange",
+                  "red" = "tomato"),
+       hline = 0, vline = 0,
+       legendPosition = 'right',
+       title = "PCA Scores Plot with Loadings",
+       subtitle = "Log2 transformed data. 95% CI ellipses",
+       ellipse = TRUE,
+       ellipseType = 't', # assumes multivariate
+       ellipseLevel = 0.95,
+       ellipseFill = TRUE,
+       ellipseAlpha = 0.2,
+       ellipseLineSize = 0,
+       showLoadings = TRUE,ntopLoadings = 10)
+
+```
+
+#### colby period
+
+```{r, fig.width=10, fig.height=8}
+# pca
+
+biplot(p,
+       lab = paste0(metadata_forPCAtools$subject),
+       colby = 'period',
+       colkey = c("b1" = "gray",
+                  "b3" = "pink"),
+       hline = 0, vline = 0,
+       legendPosition = 'right',
+       title = "PCA Scores Plot with Loadings",
+       subtitle = "Log2 transformed data. 95% CI ellipses",
+       ellipse = TRUE,
+       ellipseType = 't', # assumes multivariate
+       ellipseLevel = 0.95,
+       ellipseFill = TRUE,
+       ellipseAlpha = 0.2,
+       ellipseLineSize = 0,
+       showLoadings = TRUE)
+
+```
+
+#### colby trt_period
+
+```{r, fig.width=10, fig.height=8}
+
+biplot(p,
+       lab = paste0(metadata_forPCAtools$subject),
+       colby = 'treatment_period',
+       colkey = c("control_b1" = "darkseagreen2",
+               "control_b3" = "darkgreen",
+               "beta_b1" = "tan3",
+               "beta_b3" = "orangered2",
+               "red_b1" = "lavenderblush3",
+               "red_b3" = "darkred"),
+       hline = 0, vline = 0,
+       legendPosition = 'right',
+       title = "PCA Scores Plot with Loadings",
+       subtitle = "Log2 transformed data. 95% CI ellipses.",
+       ellipse = TRUE,
+       ellipseType = 't', # assumes multivariate
+       ellipseLevel = 0.95,
+       ellipseFill = TRUE,
+       ellipseAlpha = 0.2,
+       ellipseLineSize = 0,
+       showLoadings = TRUE, ntopLoadings = 10)
+
+```
+
+```{r, fig.width=10, fig.height=8}
+
+biplot(p,
+       lab = paste0(metadata_forPCAtools$subject),
+       colby = 'treatment_period',
+       colkey = c("control_b1" = "darkseagreen2",
+               "control_b3" = "darkgreen",
+               "beta_b1" = "tan3",
+               "beta_b3" = "orangered2",
+               "red_b1" = "lavenderblush3",
+               "red_b3" = "darkred"),
+       hline = 0, vline = 0,
+       legendPosition = 'right',
+       title = "PCA Scores Plot with Loadings",
+       subtitle = "Log2 transformed data. 95% CI ellipses.",
+       showLoadings = TRUE, ntopLoadings = 10)
+
+```
+
+Let's explore a little more
+
+How many PCs do we need to capture at least 80% variance?
+
+```{r}
+which(cumsum(p$variance) > 80)[1]
+```
+
+This shows we'd need quite a few PCs to capture most of the variance.
+
+### Pairs plots
+
+Here, we will look at separations for several components at once using pairs plots.
+
+#### treatment_period
+
+```{r, fig.width=10, fig.height=10}
+pairsplot(p,
+    components = getComponents(p, c(1:10)),
+    triangle = TRUE, trianglelabSize = 12,
+    hline = 0, vline = 0,
+    pointSize = 0.4,
+    gridlines.major = FALSE, gridlines.minor = FALSE,
+    colby = 'treatment_period',
+    colkey = c("control_b1" = "darkseagreen2",
+               "control_b3" = "darkgreen",
+               "beta_b1" = "tan",
+               "beta_b3" = "orangered2",
+               "red_b1" = "lavenderblush3",
+               "red_b3" = "darkred"),
+    title = 'Pairs plot', plotaxes = FALSE,
+    margingaps = unit(c(-0.01, -0.01, -0.01, -0.01), 'cm'))
+
+```
+
+#### period
+
+```{r, fig.width=10, fig.height=10}
+pairsplot(p,
+    components = getComponents(p, c(1:10)),
+    triangle = TRUE, trianglelabSize = 12,
+    hline = 0, vline = 0,
+    pointSize = 0.4,
+    gridlines.major = FALSE, gridlines.minor = FALSE,
+    colby = 'period',
+    colkey = c("b1" = "darkgray",
+               "b3" = "pink"),
+    title = 'Pairs plot', plotaxes = FALSE,
+    margingaps = unit(c(-0.01, -0.01, -0.01, -0.01), 'cm'))
+
+```
+
+#### sex
+
+Are there any obvious clusterings when colored by sex?
+
+```{r, fig.width=10, fig.height=10}
+  pairsplot(p,
+    components = getComponents(p, c(1:10)),
+    triangle = TRUE, trianglelabSize = 12,
+    hline = 0, vline = 0,
+    pointSize = 0.4,
+    gridlines.major = FALSE, gridlines.minor = FALSE,
+    colby = 'sex', 
+    colkey = c("M" = "red",
+               "F" = "purple"),
+    title = 'Pairs plot', plotaxes = FALSE,
+    margingaps = unit(c(-0.01, -0.01, -0.01, -0.01), 'cm'))
+```
+
+## Eigen corplots
+
+This is a cool way to explore the correlations between the metadata and the PCs! I want to look at how the metavariables correlate with PCs that account for 80% variation in the dataset.
+
+Again: How many PCs do we need to capture at least 80% variance?
+
+```{r}
+which(cumsum(p$variance) > 80)[1]
+```
+
+```{r, fig.width=12, fig.height=7.5}
+  eigencorplot(p,
+    components = getComponents(p, 1:which(cumsum(p$variance) > 80)[1]), # get components that account for 80% variance
+    metavars = colnames(metadata_forPCAtools),
+    col = c('darkblue', 'blue2', 'gray', 'red2', 'darkred'),
+    cexCorval = 0.7,
+    colCorval = 'white',
+    fontCorval = 2,
+    posLab = 'bottomleft',
+    rotLabX = 45,
+    posColKey = 'top',
+    cexLabColKey = 1.5,
+    scale = TRUE,
+    main = 'PC1-15 metadata correlations',
+    colFrame = 'white',
+    plotRsquared = FALSE)
+```
+
+```{r, fig.width=14, fig.height=7.5}
+  eigencorplot(p,
+    components = getComponents(p, 1:which(cumsum(p$variance) > 80)[1]),
+    metavars = colnames(metadata_forPCAtools),
+    col = c('white', 'cornsilk1', 'gold', 'forestgreen', 'darkgreen'),
+    cexCorval = 1.2,
+    fontCorval = 2,
+    posLab = 'all',
+    rotLabX = 45,
+    scale = TRUE,
+    main = bquote(Principal ~ component ~ Spearman ~ r^2 ~ metadata ~ correlates),
+    plotRsquared = TRUE,
+    corFUN = 'spearman',
+    corUSE = 'pairwise.complete.obs',
+    corMultipleTestCorrection = 'BH',
+    signifSymbols = c('****', '***', '**', '*', ''),
+    signifCutpoints = c(0, 0.0001, 0.001, 0.01, 0.05, 1))
+```
+
+# Univariate analysis
+
+## Wrangle data
+
+```{r}
+
+# using the most convenient df to convert to tidy
+df_for_stats <- Data_forMPCA %>%
+  pivot_longer(21:ncol(.),
+               names_to = "mz_rt",
+               values_to = "rel_abund_log2") %>%
+  unite("treatment_period", "treatment", "period", sep = "_", remove = FALSE) %>%
+  mutate_at("treatment", as.factor)
+```
+
+```{r}
+# turn off sci notation outputs
+options(scipen = 999)
+```
+
+## Parametric tests
+
+### ANOVA across treatment timepoints
+
+```{r, anova treatment}
+df_for_stats$treatment_period <- as.factor(df_for_stats$treatment_period)
+
+trt_anova_output_df <- df_for_stats %>% 
+  dplyr::select(subject, sample, treatment_period, mz_rt, rel_abund_log2) %>%
+  group_by(mz_rt) %>%
+  anova_test(rel_abund_log2 ~ treatment_period, wid = subject,
+             detailed = TRUE) %>%
+  adjust_pvalue(method = "BH") %>%
+  as.data.frame()
+
+
+trt_anova_sig <- trt_anova_output_df %>%
+  filter(p.adj < .05)
+
+head(trt_anova_sig)
+
+# how many significant features?
+nrow(trt_anova_sig)
+
+```
+
+```{r}
+trt_period_ANOVA_tukey <- df_for_stats %>% 
+  dplyr::select(subject, sample, treatment_period, mz_rt, rel_abund_log2) %>%
+  group_by(mz_rt) %>%
+  tukey_hsd(rel_abund_log2 ~ treatment_period, wid = subject)
+
+trt_tukeyHSD_sig <- trt_period_ANOVA_tukey %>%
+  filter(p.adj < .05)
+```
+
+### t tests (unpaired and paired)
+
+#### Paired control
+
+```{r}
+# run paired t-tests for control intervention
+ctrl_t.test_paired <- df_for_stats %>%
+  filter(treatment == "control") %>%
+ dplyr::select(subject, period, mz_rt, rel_abund_log2) %>%
+  group_by(mz_rt) %>%
+  t_test(rel_abund_log2 ~ period, 
+         paired = TRUE, 
+         p.adjust.method = "BH") %>% # Benjamini-Hochberg controlling to lower false positives
+  add_significance()
+```
+
+Statistically significant features
+
+```{r}
+# which features are significant?
+ctrl_t.test_paired_sig <- ctrl_t.test_paired %>%
+  filter(p < 0.05)
+kable(ctrl_t.test_paired_sig)
+
+# how many are significant?
+nrow(ctrl_t.test_paired_sig)
+```
+
+##### ANOVA overlap
+
+Keep sig features in t-test that have a match in sig ANOVA
+
+```{r}
+sig_overlap_ctrl_paired <- inner_join(ctrl_t.test_paired_sig,
+                                   trt_tukeyHSD_sig,
+                                   by = "mz_rt",
+                                   suffix = c(".t-test", ".tukeys"))
+```
+
+
+#### Paired beta
+
+```{r}
+# run paired t-tests for control intervention
+beta_t.test_paired <- df_for_stats %>%
+  filter(treatment == "beta") %>%
+ dplyr::select(subject, period, mz_rt, rel_abund_log2) %>%
+  group_by(mz_rt) %>%
+  t_test(rel_abund_log2 ~ period, 
+         paired = TRUE, 
+         p.adjust.method = "BH") %>% # Benjamini-Hochberg controlling to lower false positives
+  add_significance()
+```
+
+Statistically significant features
+
+```{r}
+# which features are significant?
+beta_t.test_paired_sig <- beta_t.test_paired %>%
+  filter(p < 0.05)
+kable(beta_t.test_paired_sig)
+
+# how many are significant?
+nrow(beta_t.test_paired_sig)
+```
+
+##### Remove BG diet
+
+```{r}
+# let's grab both datasets for features sig in pre v post beta and pre v post control and combine them
+fulljoin_t.test_betaANDctrl <- full_join(beta_t.test_paired_sig, ctrl_t.test_paired_sig,
+                                        by = "mz_rt",
+                                        suffix = c(".beta", ".ctrl"))
+
+# number of features in combined list
+nrow(fulljoin_t.test_betaANDctrl)
+
+```
+
+Let's try and remove features significant due to the background diet
+
+```{r}
+sig_paired_beta_rmBG <- fulljoin_t.test_betaANDctrl %>%
+  # add a column to account for direction
+  mutate(sign = statistic.beta * statistic.ctrl) %>%
+  # replace NAs in the sign column with 0
+  mutate(sign = replace_na(sign, 0)) %>%
+  # replace NAs in the statistic.ctrl column to 0
+  mutate(statistic.ctrl = replace_na(statistic.ctrl, 0)) %>%
+  # filter for columns that are either negative (means ctrl and tomato are going in opposite dir) or where the stat.ctrl col is 0 (so we don't remove features that are just not present in the sig control list)
+  filter((sign < 0 | statistic.ctrl == 0))
+
+# number of features without bg diet effect
+nrow(sig_paired_beta_rmBG)
+```
+
+How many BG-diet-related features did we remove from the list of significant beta features?
+
+```{r}
+nrow(beta_t.test_paired_sig) - nrow(sig_paired_beta_rmBG)
+```
+
+##### ANOVA overlap
+
+Keep sig features in t-test that have a match in sig ANOVA. Let's take our new feature list (background diet effect removed)
+
+```{r}
+# select only features from paired list that have a match in ANOVA list
+beta_sig_ANOVA_overlap_paired <- inner_join(sig_paired_beta_rmBG,
+                                            trt_tukeyHSD_sig,
+                                            by = "mz_rt",
+                                            suffix = c(".t-test", ".tukeys"))
+
+# features overlapping with sig ANOVA
+unique(beta_sig_ANOVA_overlap_paired$mz_rt)
+```
+
+
+#### Paired red
+
+```{r}
+# run paired t-tests for control intervention
+red_t.test_paired <- df_for_stats %>%
+  filter(treatment == "red") %>%
+ dplyr::select(subject, period, mz_rt, rel_abund_log2) %>%
+  group_by(mz_rt) %>%
+  t_test(rel_abund_log2 ~ period, 
+         paired = TRUE, 
+         p.adjust.method = "BH") %>% # Benjamini-Hochberg controlling to lower false positives
+  add_significance()
+```
+
+Statistically significant features
+
+```{r}
+# which features are significant?
+red_t.test_paired_sig <- red_t.test_paired %>%
+  filter(p < 0.05)
+kable(red_t.test_paired_sig)
+
+# how many are significant?
+nrow(red_t.test_paired_sig)
+```
+
+##### Remove BG diet
+
+```{r}
+# let's grab both datasets for features sig in pre v post red and pre v post control and combine them
+fulljoin_t.test_redANDctrl <- full_join(red_t.test_paired_sig, ctrl_t.test_paired_sig,
+                                        by = "mz_rt",
+                                        suffix = c(".red", ".ctrl"))
+
+# number of features in combined list
+nrow(fulljoin_t.test_redANDctrl)
+
+```
+
+Let's try and remove features significant due to the background diet
+
+```{r}
+sig_paired_red_rmBG <- fulljoin_t.test_redANDctrl %>%
+  # add a column to account for direction
+  mutate(sign = statistic.red * statistic.ctrl) %>%
+  # replace NAs in the sign column with 0
+  mutate(sign = replace_na(sign, 0)) %>%
+  # replace NAs in the statistic.ctrl column to 0
+  mutate(statistic.ctrl = replace_na(statistic.ctrl, 0)) %>%
+  # filter for columns that are either negative (means ctrl and tomato are going in opposite dir) or where the stat.ctrl col is 0 (so we don't remove features that are just not present in the sig control list)
+  filter((sign < 0 | statistic.ctrl == 0))
+
+# number of features without bg diet effect
+nrow(sig_paired_red_rmBG)
+```
+
+How many BG-diet-related features did we remove from the list of significant beta features?
+
+```{r}
+nrow(red_t.test_paired_sig) - nrow(sig_paired_red_rmBG)
+```
+
+##### ANOVA overlap
+
+Keep sig features in t-test that have a match in sig ANOVA. Let's take our new feature list (background diet effect removed)
+
+```{r}
+# select only features from paired list that have a match in ANOVA list
+red_sig_ANOVA_overlap_paired <- inner_join(sig_paired_red_rmBG,
+                                            trt_tukeyHSD_sig,
+                                            by = "mz_rt",
+                                            suffix = c(".t-test", ".tukeys"))
+
+# features overlapping with sig ANOVA
+unique(red_sig_ANOVA_overlap_paired$mz_rt)
+```
+
+#### Paired tomato
+
+```{r}
+# run paired t-tests for control intervention
+tomato_t.test_paired <- df_for_stats %>%
+  filter(tomato_or_control == "tomato") %>%
+ dplyr::select(subject, period, mz_rt, rel_abund_log2) %>%
+  group_by(mz_rt) %>%
+  t_test(rel_abund_log2 ~ period, 
+         paired = TRUE, 
+         p.adjust.method = "BH") %>% # Benjamini-Hochberg controlling to lower false positives
+  add_significance()
+```
+
+Statistically significant features
+
+```{r}
+# which features are significant?
+tomato_t.test_paired_sig <- tomato_t.test_paired %>%
+  filter(p < 0.05)
+kable(tomato_t.test_paired_sig)
+
+# how many are significant?
+nrow(tomato_t.test_paired_sig)
+```
+
+##### Remove BG diet
+
+```{r}
+# let's grab both datasets for features sig in pre v post red and pre v post control and combine them
+fulljoin_t.test_tomANDctrl <- full_join(tomato_t.test_paired_sig, ctrl_t.test_paired_sig,
+                                        by = "mz_rt",
+                                        suffix = c(".tom", ".ctrl"))
+
+# number features in full list
+nrow(fulljoin_t.test_tomANDctrl)
+
+```
+
+Let's try and remove features significant due to the background diet
+
+```{r}
+sig_paired_tom_rmBG <- fulljoin_t.test_tomANDctrl %>%
+  # add a column to account for direction
+  mutate(sign = statistic.tom * statistic.ctrl) %>%
+  # replace NAs in the sign column with 0
+  mutate(sign = replace_na(sign, 0)) %>%
+  # replace NAs in the statistic.ctrl column to 0
+  mutate(statistic.ctrl = replace_na(statistic.ctrl, 0)) %>%
+  # filter for columns that are either negative (means ctrl and tomato are going in opposite dir) or where the stat.ctrl col is 0 (so we don't remove features that are just not present in the sig control list)
+  filter((sign < 0 | statistic.ctrl == 0))
+
+# number of features in new list without bg diet effect
+nrow(sig_paired_tom_rmBG)
+```
+
+How many BG-diet-related features did we remove from the list of significant beta features?
+
+```{r}
+nrow(tomato_t.test_paired_sig) - nrow(sig_paired_tom_rmBG)
+```
+
+##### ANOVA overlap
+
+Keep sig features in t-test that have a match in sig ANOVA. Let's take our new feature list (background diet effect removed)
+
+```{r}
+# select only features from paired list that have a match in ANOVA list
+tom_sig_ANOVA_overlap_paired <- inner_join(sig_paired_tom_rmBG,
+                                            trt_tukeyHSD_sig,
+                                            by = "mz_rt",
+                                            suffix = c(".t-test", ".tukeys"))
+
+# features overlapping with sig ANOVA
+unique(tom_sig_ANOVA_overlap_paired$mz_rt)
+```
+
+
+Here, I will compare control to each tomato treatment individually, and then tomato treatments against each other. I will also compare tomato to control. I am using the log transformed values of rel abundance since parametric tests assume normality.
+
+#### Red v ctrl
+
+```{r, red v ctrl}
+# run t-test
+red_v_ctrl_t.test <- df_for_stats %>%
+  filter(treatment %in% c("control", "red")) %>%
+  filter(period == "b3") %>%
+  dplyr::select(subject, treatment, mz_rt, rel_abund_log2) %>%
+  group_by(mz_rt) %>%
+  t_test(rel_abund_log2 ~ treatment, 
+         paired = FALSE, 
+         p.adjust.method = "BH") %>% # Benjamini-Hochberg controlling to lower false positives
+  add_significance()
+```
+
+Statistically significant features
+
+```{r}
+# which features are significant?
+sig_red_v_ctrl_t.test <- red_v_ctrl_t.test %>%
+  filter(p < 0.05)
+kable(sig_red_v_ctrl_t.test)
+
+# how many are significant?
+nrow(sig_red_v_ctrl_t.test)
+```
+
+##### ANOVA overlap
+
+Keep sig features in unpaired t-test that have a match in sig ANOVA
+
+```{r}
+sig_overlap_ctrl_red <- inner_join(sig_red_v_ctrl_t.test,
+                                   trt_tukeyHSD_sig,
+                                   by = "mz_rt",
+                                   suffix = c(".t-test", ".tukeys"))
+
+unique(sig_overlap_ctrl_red$mz_rt)
+```
+
+
+
+#### Beta v ctrl
+
+```{r, beta v ctrl t-test with outlier}
+# run t-tests
+beta_v_ctrl_t.test <- df_for_stats %>%
+  filter(treatment %in% c("control" , "beta"),
+         period == "b3") %>%
+  dplyr::select(subject, treatment, mz_rt, rel_abund_log2) %>%
+  group_by(mz_rt) %>%
+  t_test(rel_abund_log2 ~ treatment, 
+         paired = FALSE, 
+         p.adjust.method = "BH") %>% # Benjamini-Hochberg controlling to lower false positives
+  add_significance()
+```
+
+Statistically significant features
+
+```{r}
+# which features are significant?
+sig_beta_v_ctrl_t.test <- beta_v_ctrl_t.test %>%
+  filter(p < 0.05)
+kable(sig_beta_v_ctrl_t.test)
+
+# how many are significant?
+nrow(sig_beta_v_ctrl_t.test)
+```
+
+##### ANOVA overlap
+
+Keep sig features in t-test that have a match in sig ANOVA
+
+```{r}
+sig_overlap_ctrl_beta <- inner_join(sig_beta_v_ctrl_t.test,
+                                   trt_tukeyHSD_sig,
+                                   by = "mz_rt",
+                                   suffix = c(".t-test", ".tukeys"))
+
+# which features overlap?
+unique(sig_overlap_ctrl_beta$mz_rt)
+```
+
+#### Beta v red
+
+```{r, beta v red t test}
+# run t-tests
+beta_v_red_t.test <- df_for_stats %>%
+  filter(treatment %in% c("beta", "red"),
+         period == "b3") %>%
+  dplyr::select(subject, treatment, mz_rt, rel_abund_log2) %>%
+  group_by(mz_rt) %>%
+  t_test(rel_abund_log2 ~ treatment, 
+         paired = FALSE, 
+         p.adjust.method = "BH") %>% # Benjamini-Hochberg controlling to lower false positives
+  add_significance()
+```
+
+Statistically significant features
+
+```{r}
+# which features are significant?
+sig_beta_v_red_t.test <- beta_v_red_t.test %>%
+  filter(p < 0.05)
+kable(sig_beta_v_red_t.test)
+
+# how many are significant?
+nrow(sig_beta_v_red_t.test)
+```
+
+##### ANOVA overlap
+
+Keep sig features in t-test that have a match in sig ANOVA
+
+```{r}
+sig_overlap_beta_red <- inner_join(sig_beta_v_red_t.test,
+                                   trt_tukeyHSD_sig,
+                                   by = "mz_rt",
+                                   suffix = c(".t-test", ".tukeys"))
+
+# which features overlap?
+unique(sig_overlap_beta_red$mz_rt)
+```
+
+
+#### Tomato v ctrl
+
+```{r, tomato v control t-test}
+# run t-tests
+tom_v_ctrl_t.test <- df_for_stats %>%
+  filter(tomato_or_control %in% c("control", "tomato"),
+         period == "b3") %>%
+  dplyr::select(subject, tomato_or_control, mz_rt, rel_abund_log2) %>%
+  group_by(mz_rt) %>%
+  t_test(rel_abund_log2 ~ tomato_or_control, 
+         paired = FALSE, 
+         p.adjust.method = "BH") %>% # Benjamini-Hochberg controlling to lower false positives
+  add_significance()
+```
+
+Statistically significant features
+
+```{r}
+# which features are significant?
+sig_tom_v_ctrl_t.test <- tom_v_ctrl_t.test %>%
+  filter(p < 0.05)
+kable(sig_tom_v_ctrl_t.test)
+
+# how many are significant?
+nrow(sig_tom_v_ctrl_t.test)
+```
+
+##### ANOVA overlap
+
+Keep sig features in t-test that have a match in sig ANOVA
+
+```{r}
+sig_overlap_tom_ctrl <- inner_join(sig_tom_v_ctrl_t.test,
+                                   trt_tukeyHSD_sig,
+                                   by = "mz_rt",
+                                   suffix = c(".t-test", ".tukeys"))
+
+# which features overlap?
+unique(sig_overlap_tom_ctrl$mz_rt)
+```
+
+### Heatmaps
+
+#### ANOVA
+
+```{r}
+# go back to wide for stats df
+df_for_stats_wide <- df_for_stats %>%
+  pivot_wider(names_from = mz_rt,
+              values_from = rel_abund_log2)
+
+ANOVA_trtperiod_heatmap_data <- df_for_stats_wide %>%
+  filter(period == "b3") %>%
+  dplyr::select(sample, 
+                all_of(trt_anova_sig$mz_rt)) %>%
+  column_to_rownames("sample")
+
+head(ANOVA_trtperiod_heatmap_data, n=3)
+  
+```
+
+```{r}
+# pull metadata
+metadata_Heatmap <- metadata
+
+# change treatment to factor
+metadata_Heatmap$treatment <- as.factor(metadata_Heatmap$treatment)
+
+# make it so that rownames in metadata match rownames from heatmap df
+rownames(metadata_Heatmap) <- rownames(ANOVA_trtperiod_heatmap_data)
+
+# create annotation rows for treatment and wrangle
+# select rownames (samples) from heatmap metadata (also ensures the order is correct)
+anno_trt_row <- as.data.frame(rownames(metadata_Heatmap))
+
+# pull trt column
+anno_trt_row$treatment <- metadata_Heatmap$treatment
+anno_trt_row$sex <- metadata_Heatmap$sex
+
+# select trt
+anno_trt_row <- anno_trt_row %>%
+  dplyr::select(treatment, sex)
+
+# get rownames to match heatmap again
+rownames(anno_trt_row) <- rownames(metadata_Heatmap)
+```
+
+```{r}
+# create annotation colors
+annotation_colors <- list(treatment = c("beta" = "orange",
+                                        "control" = "green",
+                                        "red" = "tomato"),
+                          sex = c("M" = "burlywood",
+                                  "F" = "pink"))
+```
+
+```{r, fig.height=12, fig.width=10}
+pheatmap(t(ANOVA_trtperiod_heatmap_data),
+           scale = "row",
+           cluster_rows = TRUE,
+           annotation_col = anno_trt_row,
+           annotation_colors = annotation_colors,
+           cluster_cols = TRUE,
+           show_colnames = TRUE,
+           clustering_distance_rows = "euclidean",
+           clustering_distance_cols = "euclidean",
+           cutree_rows = 8,
+           cutree_cols = 3,
+           clustering_method = "ward.D2",
+           color = colorRampPalette(c("#67a9cf", "#f7f7f7", "#ef8a62"))(16),
+           main = "Heatmap of features significant in ANOVA across all treatment groups \nby Benjamoni-Hochberg corrected \np-values > 0.05 \nLipidomics C18 (+) \nShowing only post-intervention timepoints") 
+
+```
+
+```{r, fig.height=12, fig.width=10}
+# Without hierarchical clustering of samples (cols)
+pheatmap(t(ANOVA_trtperiod_heatmap_data),
+           scale = "row",
+           cluster_rows = TRUE,
+           annotation_col = anno_trt_row,
+           annotation_colors = annotation_colors,
+           cluster_cols = FALSE,
+           show_colnames = TRUE,
+           clustering_distance_rows = "euclidean",
+           clustering_distance_cols = "euclidean",
+           cutree_rows = 8,
+           cutree_cols = 3,
+           clustering_method = "ward.D2",
+           color = colorRampPalette(c("#67a9cf", "#f7f7f7", "#ef8a62"))(16),
+           main = "Heatmap of features significant in ANOVA across treatment groups \nby Benjamoni-Hochberg corrected \np-values > 0.05 \nLipidomics C18 (+) \nShowing only post-intervention timepoints") 
+
+```
+
+#### Unpaired
+
+```{r}
+
+unpaired_t.tests_heatmap_data <- df_for_stats_wide %>%
+  filter(period == "b3") %>%
+  dplyr::select(sample, 
+                all_of(sig_overlap_ctrl_beta$mz_rt),
+                all_of(sig_overlap_ctrl_red$mz_rt),
+                all_of(sig_overlap_tom_ctrl$mz_rt),
+                all_of(sig_overlap_beta_red$mz_rt)) %>%
+  column_to_rownames("sample")
+
+head(unpaired_t.tests_heatmap_data,n = 3)
+  
+```
+
+```{r, fig.height=20, fig.width=15}
+pheatmap(t(unpaired_t.tests_heatmap_data),
+           scale = "row",
+           cluster_rows = TRUE,
+           annotation_col = anno_trt_row,
+           annotation_colors = annotation_colors,
+           cluster_cols = TRUE,
+           show_colnames = TRUE,
+           clustering_distance_rows = "euclidean",
+           clustering_distance_cols = "euclidean",
+         cutree_rows = 8,
+         cutree_cols = 3,
+           clustering_method = "ward.D2",
+           color = colorRampPalette(c("#67a9cf", "#f7f7f7", "#ef8a62"))(16),
+           main = "Heatmap of features significant in all unpaired t-test comparisons that overlap with sig ANOVA features across all treatment groups \nby Benjamoni-Hochberg corrected \np-values > 0.05 \nLipidomics C18 (+)")
+
+```
+
+```{r, fig.height=20, fig.width=15}
+# without clustering of cols
+pheatmap(t(unpaired_t.tests_heatmap_data),
+           scale = "row",
+           cluster_rows = TRUE,
+           annotation_col = anno_trt_row,
+           annotation_colors = annotation_colors,
+           cluster_cols = FALSE,
+           show_colnames = TRUE,
+           clustering_distance_rows = "euclidean",
+           clustering_distance_cols = "euclidean",
+         cutree_rows = 8,
+         cutree_cols = 3,
+           clustering_method = "ward.D2",
+           color = colorRampPalette(c("#67a9cf", "#f7f7f7", "#ef8a62"))(16),
+           main = "Heatmap of features significant in all unpaired t-test comparisons that overlap with sig ANOVA features across all treatment groups \nby Benjamoni-Hochberg corrected \np-values > 0.05 \nLipidomics C18 (+)")
+
+```
+
+#### Paired
+
+##### Red
+
+```{r}
+red_paired_t.tests_heatmap_data <- df_for_stats_wide %>%
+  filter(treatment == "red") %>%
+  dplyr::select(sample, period, treatment, sex,
+                all_of(red_sig_ANOVA_overlap_paired$mz_rt)) %>%
+  mutate_at("period", as.factor) %>%
+  column_to_rownames("sample")
+```
+
+```{r}
+# create annotation rows for pre/post interventions and wrangle
+# select rownames (samples) from heatmap metadata (also ensures the order is correct)
+anno_red_row_paired <- as.data.frame(rownames(red_paired_t.tests_heatmap_data))
+
+
+# pull period into a column
+anno_red_row_paired$period <- red_paired_t.tests_heatmap_data$period
+anno_red_row_paired$sex <- red_paired_t.tests_heatmap_data$sex
+
+# select cols
+anno_red_row_paired <- anno_red_row_paired %>%
+  dplyr::select(period, sex)
+
+# get rownames to match heatmap again
+rownames(anno_red_row_paired) <- rownames(red_paired_t.tests_heatmap_data)
+```
+
+```{r}
+# create annotation colors
+red_annotation_colors <- list(period = c("b1" = "darksalmon",
+                                        "b3" = "red"),
+                              sex = c("M" = "aquamarine2",
+                                      "F" = "pink"))
+```
+
+```{r, fig.height=8, fig.width=10}
+pheatmap(t(red_paired_t.tests_heatmap_data[,-c(1:3)]),
+           scale = "row",
+           cluster_rows = TRUE,
+           annotation_col = anno_red_row_paired,
+           annotation_colors = red_annotation_colors,
+           cluster_cols = TRUE,
+           show_rownames = TRUE,
+           clustering_distance_rows = "euclidean",
+           clustering_distance_cols = "euclidean",
+           cutree_rows = 8,
+         cutree_cols = 2,
+           clustering_method = "ward.D2",
+           color = colorRampPalette(c("#67a9cf", "#f7f7f7", "#ef8a62"))(16),
+           main = "Heatmap of significant features pre- vs. post-High-Lyc paired t-test \nsig in ANOVA across all treatment groups \nby Benjamoni-Hochberg corrected p-values > 0.05 \nBackground diet effect removed \nLipidomics C18 (+)")
+  
+```
+
+##### Beta
+
+```{r}
+beta_paired_t.tests_heatmap_data <- df_for_stats_wide %>%
+  filter(treatment == "beta") %>%
+  dplyr::select(sample, period, treatment, sex,
+                all_of(beta_sig_ANOVA_overlap_paired$mz_rt)) %>%
+  mutate_at("period", as.factor) %>%
+  column_to_rownames("sample")
+```
+
+```{r}
+# create annotation rows for pre/post interventions and wrangle
+# select rownames (samples) from heatmap metadata (also ensures the order is correct)
+anno_beta_row_paired <- as.data.frame(rownames(beta_paired_t.tests_heatmap_data))
+
+
+# pull period into a column
+anno_beta_row_paired$period <- beta_paired_t.tests_heatmap_data$period
+anno_beta_row_paired$sex <- beta_paired_t.tests_heatmap_data$sex
+
+# select cols
+anno_beta_row_paired <- anno_beta_row_paired %>%
+  dplyr::select(sex, period)
+
+# get rownames to match heatmap again
+rownames(anno_beta_row_paired) <- rownames(beta_paired_t.tests_heatmap_data)
+```
+
+```{r}
+# create annotation colors
+beta_annotation_colors <- list(period = c("b1" = "bisque",
+                                        "b3" = "darkorange"),
+                              sex = c("M" = "aquamarine2",
+                                      "F" = "pink"))
+```
+
+```{r, fig.height=10, fig.width=10}
+pheatmap(t(beta_paired_t.tests_heatmap_data[,-c(1:3)]),
+           scale = "row",
+           cluster_rows = TRUE,
+           annotation_col = anno_beta_row_paired,
+           annotation_colors = beta_annotation_colors,
+           cluster_cols = TRUE,
+           show_rownames = TRUE,
+           clustering_distance_rows = "euclidean",
+           clustering_distance_cols = "euclidean",
+           cutree_rows = 10,
+         cutree_cols = 5,
+           clustering_method = "ward.D2",
+           color = colorRampPalette(c("#67a9cf", "#f7f7f7", "#ef8a62"))(16),
+           main = "Heatmap of significant features pre- vs. post-High-beta paired t-test \nsig in ANOVA across all treatment groups \nby Benjamoni-Hochberg corrected p-values > 0.05 \nBackground diet effect removed \nLipidomics C18 (+)")
+  
+```
+
+##### Tomato
+
+```{r}
+tom_paired_t.tests_heatmap_data <- df_for_stats_wide %>%
+  filter(treatment != "control") %>%
+  dplyr::select(sample, period, tomato_or_control, sex,
+                all_of(tom_sig_ANOVA_overlap_paired$mz_rt)) %>%
+  mutate_at("period", as.factor) %>%
+  column_to_rownames("sample")
+```
+
+```{r}
+# create annotation rows for pre/post interventions and wrangle
+# select rownames (samples) from heatmap metadata (also ensures the order is correct)
+anno_tom_row_paired <- as.data.frame(rownames(tom_paired_t.tests_heatmap_data))
+
+
+# pull period into a column
+anno_tom_row_paired$period <- tom_paired_t.tests_heatmap_data$period
+anno_tom_row_paired$sex <- tom_paired_t.tests_heatmap_data$sex
+
+# select cols
+anno_tom_row_paired <- anno_tom_row_paired %>%
+  dplyr::select(period, sex)
+
+# get rownames to match heatmap again
+rownames(anno_tom_row_paired) <- rownames(tom_paired_t.tests_heatmap_data)
+```
+
+```{r}
+# create annotation colors
+tom_annotation_colors <- list(period = c("b1" = "darksalmon",
+                                        "b3" = "tomato"),
+                              sex = c("M" = "aquamarine2",
+                                      "F" = "pink"))
+```
+
+```{r, fig.height=12, fig.width=10}
+pheatmap(t(tom_paired_t.tests_heatmap_data[,-c(1:3)]),
+           scale = "row",
+           cluster_rows = TRUE,
+           annotation_col = anno_tom_row_paired,
+           annotation_colors = tom_annotation_colors,
+           cluster_cols = TRUE,
+           show_rownames = TRUE,
+           clustering_distance_rows = "euclidean",
+           clustering_distance_cols = "euclidean",
+           cutree_rows = 8,
+         cutree_cols = 2,
+           clustering_method = "ward.D2",
+           color = colorRampPalette(c("#67a9cf", "#f7f7f7", "#ef8a62"))(16),
+           main = "Heatmap of significant features pre- vs. post-Tomato paired t-test \nsig in ANOVA across all treatment groups \nby Benjamoni-Hochberg corrected p-values > 0.05 \nBackground diet effect removed \nLipidomics C18 (+)")
+  
+```
+
+# Joined lists
+
+```{r}
+df_for_stats <- df_for_stats %>%
+  # add rel abund levels back since this got lost during drift correction
+  mutate(rel_abund = 2^(rel_abund_log2))
+```
+
+## Using t tests sig
+
+### Tomato effects
+
+How many features are significant (with background diet effect removed)
+
+```{r}
+dim(sig_paired_tom_rmBG)
+```
+
+Which features are significant in unpaired t test comparisons?
+
+```{r}
+# select only significant features from pre v post tomato effect that have a matching key to significant features post tomato v. post control comparison
+
+overall_tomato_effect <- semi_join(sig_paired_tom_rmBG,
+                                   sig_tom_v_ctrl_t.test,
+                                  by = "mz_rt")
+
+dim(overall_tomato_effect)
+```
+
+#### Summary stats
+
+```{r}
+(FC_tomato_effect <- df_for_stats %>%
+  filter(mz_rt %in% overall_tomato_effect$mz_rt) %>%
+  select(subject, treatment_period, mz_rt, rel_abund) %>%
+  group_by(mz_rt) %>%
+  pivot_wider(names_from = treatment_period,
+              values_from = rel_abund) %>%
+  mutate(control_FC = control_b3/control_b1,
+         beta_FC = beta_b3/beta_b1,
+         red_FC = red_b3/red_b1) %>%
+  summarize(mean_control_FC = mean(control_FC, na.rm = TRUE),
+            mean_beta_FC = mean(beta_FC, na.rm = TRUE),
+            mean_red_FC = mean(red_FC, na.rm = TRUE),
+            mean_ctrl_beta_FC = mean(mean(beta_FC, na.rm = TRUE)/mean(control_FC, na.rm = TRUE)),
+            mean_ctrl_red_FC = mean(mean(red_FC, na.rm = TRUE)/mean(control_FC, na.rm = TRUE)),
+            mean_red_beta_FC = mean(mean(beta_FC, na.rm = TRUE)/mean(red_FC, na.rm = TRUE))))
+```
+
+#### Compile list
+
+```{r}
+# combine cluster and FC info
+tom_effect_list <- left_join(FC_tomato_effect, 
+                             cluster_features,
+                             by = "mz_rt") %>%
+  select(mz_rt, mz, rt, Cluster_ID, Cluster_features, Cluster_size, everything())
+
+
+```
+
+```{r}
+# add in averages for each group + timepoint
+tom_effect_list <-
+  left_join(tom_effect_list,
+            (df_for_stats %>%
+               group_by(treatment_period, mz_rt) %>%
+               summarize(mean_rel_abund = mean(rel_abund)) %>%
+               pivot_wider(names_from = treatment_period, values_from = mean_rel_abund)),
+            by = "mz_rt")
+
+head(tom_effect_list, n=1)
+```
+
+#### Export list
+
+```{r}
+write_csv(tom_effect_list, "effect lists/tomato-effect.csv")
+```
+
+#### Boxplots
+
+```{r}
+# make comparison list for comparison tests
+my_comparisons <- list( c("beta_b1", "beta_b3"), 
+                        c("red_b1", "red_b3"),
+                        c("control_b1", "control_b3") )
+```
+
+```{r}
+# subset df for uniquely significant features
+justT_tom_effect_df <- df_for_stats_wide %>%
+  dplyr::select(c(1:21),
+                (all_of(overall_tomato_effect$mz_rt)))
+
+# make tidy df
+justT_tom_effect_df_tidy <- justT_tom_effect_df %>%
+  pivot_longer(cols = 22:ncol(.),
+               names_to = "mz_rt",
+               values_to = "rel_abund_log2")
+```
+
+```{r}
+# fix factor levels for time points
+justT_tom_effect_df_tidy$treatment_period <- factor(justT_tom_effect_df_tidy$treatment_period,
+                              levels = c("control_b1", "control_b3", 
+                                         "beta_b1", "beta_b3",
+                                         "red_b1", "red_b3"))
+
+# check
+levels(justT_tom_effect_df_tidy$treatment_period)  
+
+justT_tom_effect_df_tidy$treatment <- factor(justT_tom_effect_df_tidy$treatment,
+                              levels = c("control", "beta", "red"))
+```
+
+```{r, fig.width=12, fig.height=15}
+justT_tom_effect_df_tidy %>% 
+  ggplot(aes(x = treatment_period, y = rel_abund_log2, fill = treatment_period)) +
+  geom_boxplot() +
+  scale_fill_manual(values = c("darkseagreen2", "darkgreen", 
+                               "tan", "orangered2",
+                               "lavenderblush3", "darkred"),
+                    labels = c("pre control", "post control",
+                               "pre beta", "post beta",
+                               "pre lyc", "post lyc")) +
+  scale_x_discrete(labels = c("", "", "", "", "", "")) +
+  geom_line(aes(group = subject, colour = subject), size = 0.2) +
+  theme_classic(base_size = 12, base_family = "sans") +
+  facet_wrap(vars(mz_rt), scales = "free_y", ncol = 4) + 
+  stat_compare_means(comparisons = my_comparisons, method = "t.test", paired = TRUE, p.adjust.method = "BH") +
+  labs(x = "",
+       y = "Log2 transformed relative abundance",
+       title = "Tomato effect - significant when compared to control, also significant pre and post tomato",
+       subtitle = "FDR adj. p-values from T-tests")
+  
+```
+
+### Beta effects
+
+```{r}
+dim(sig_paired_beta_rmBG)
+```
+
+Which features are significant in paired t test comparisons for beta, but not significant in the same direction for control?
+
+Features that are significant in both pre- vs. post. beta AND post-beta vs. post-control
+
+```{r}
+# select features that are only significant post beta v. post control comparison
+overall_beta_effect <- semi_join(sig_paired_beta_rmBG,
+                                 sig_beta_v_ctrl_t.test,
+                                 by = "mz_rt")
+dim(overall_beta_effect)
+```
+
+```{r}
+
+overall_unique_beta_effect <- left_join(overall_beta_effect,
+                                        sig_beta_v_red_t.test,
+                                        by = "mz_rt")
+dim(overall_unique_beta_effect)
+```
+
+#### Summary stats
+
+```{r}
+(FC_beta_effect <- df_for_stats %>%
+  filter(mz_rt %in% overall_beta_effect$mz_rt) %>%
+  select(subject, treatment_period, mz_rt, rel_abund) %>%
+  group_by(mz_rt) %>%
+  pivot_wider(names_from = treatment_period,
+              values_from = rel_abund) %>%
+  mutate(control_FC = control_b3/control_b1,
+         beta_FC = beta_b3/beta_b1,
+         red_FC = red_b3/red_b1) %>%
+  summarize(mean_control_FC = mean(control_FC, na.rm = TRUE),
+            mean_beta_FC = mean(beta_FC, na.rm = TRUE),
+            mean_red_FC = mean(red_FC, na.rm = TRUE),
+            mean_ctrl_beta_FC = mean(mean(beta_FC, na.rm = TRUE)/mean(control_FC, na.rm = TRUE)),
+            mean_ctrl_red_FC = mean(mean(red_FC, na.rm = TRUE)/mean(control_FC, na.rm = TRUE)),
+            mean_red_beta_FC = mean(mean(beta_FC, na.rm = TRUE)/mean(red_FC, na.rm = TRUE))))
+```
+
+#### Compile list
+
+```{r}
+# combine cluster and FC info
+beta_effect_list <- left_join(FC_beta_effect, 
+                              cluster_features,
+                              by = "mz_rt") %>%
+  select(mz_rt, mz, rt, Cluster_ID, Cluster_features, Cluster_size, everything())
+
+
+```
+
+```{r}
+# add in averages for each group + timepoint
+beta_effect_list <-
+  left_join(beta_effect_list,
+            (df_for_stats %>%
+               group_by(treatment_period, mz_rt) %>%
+               summarize(mean_rel_abund = mean(rel_abund)) %>%
+               pivot_wider(names_from = treatment_period, values_from = mean_rel_abund)),
+            by = "mz_rt")
+
+head(beta_effect_list, n=1)
+```
+
+#### Export list
+
+```{r}
+write_csv(beta_effect_list, "effect lists/beta-effect.csv")
+```
+
+#### Boxplots
+
+```{r}
+# subset df for uniquely significant features
+justT_beta_effect_df <- df_for_stats_wide %>%
+  dplyr::select(c(1:21),
+                (all_of(overall_beta_effect$mz_rt)))
+
+# make tidy df
+justT_beta_effect_df_tidy <- justT_beta_effect_df %>%
+  pivot_longer(cols = 22:ncol(.),
+               names_to = "mz_rt",
+               values_to = "rel_abund_log2")
+```
+
+```{r}
+# fix factor levels for time points
+justT_beta_effect_df_tidy$treatment_period <- factor(justT_beta_effect_df_tidy$treatment_period,
+                              levels = c("control_b1", "control_b3", 
+                                         "beta_b1", "beta_b3",
+                                         "red_b1", "red_b3"))
+
+# check
+levels(justT_beta_effect_df_tidy$treatment_period)  
+
+justT_beta_effect_df_tidy$treatment <- factor(justT_beta_effect_df_tidy$treatment,
+                              levels = c("control", "beta", "red"))
+
+justT_beta_effect_df_tidy$period <- factor(justT_beta_effect_df_tidy$period,
+                              levels = c("b1", "b3"))
+```
+
+```{r, fig.width=12, fig.height=18}
+justT_beta_effect_df_tidy %>% 
+  ggplot(aes(x = treatment_period, y = rel_abund_log2, fill = treatment_period)) +
+  geom_boxplot() +
+  scale_fill_manual(values = c("darkseagreen2", "darkgreen", 
+                               "tan", "orangered2",
+                               "lavenderblush3", "darkred"),
+                    labels = c("pre control", "post control",
+                               "pre beta", "post beta",
+                               "pre lyc", "post lyc")) +
+  scale_x_discrete(labels = c("", "", "", "", "", "")) +
+  geom_line(aes(group = subject, colour = subject), size = 0.2) +
+  theme_classic(base_size = 12, base_family = "sans") +
+  facet_wrap(vars(mz_rt), scales = "free_y", nrow = 3) + 
+  stat_compare_means(comparisons = my_comparisons, method = "t.test", paired = TRUE, p.adjust.method = "BH") +
+  labs(x = "",
+       y = "Log2 transformed relative abundance",
+       title = "High beta juice effect - significant when compared to control, also significant pre and post beta juice",
+       subtitle = "FDR adj. p-values from T-tests")
+```
+
+##### m/z 1002
+
+```{r, fig.width=8, fig.height=6}
+
+(mz1002_bps <- justT_beta_effect_df_tidy %>% 
+   filter(mz_rt == "1002.658_3.079") %>%
+  ggpaired(x = "period", y = "rel_abund_log2", fill = "treatment", 
+           line.color = "gray", 
+           line.size = 1, 
+           facet.by = "treatment", 
+           short.panel.labs = FALSE, panel.labs = list(treatment = c("Control", "High \n\u03b2-Carotene", "High \nLycopene"))) +
+  scale_fill_manual(values = c("lightgreen", 
+                               "orange",
+                               "red"),
+                    labels = c("Control",
+                               "High \u03b2-Carotene",
+                               "High Lycopene"),
+                    name = "Treatment") +
+   scale_x_discrete(labels = c("b1" = "pre",
+                               "b3" = "post")) +
+  geom_line(aes(group = subject), colour = "gray", linewidth = 0.15) +
+  theme_classic(base_size = 18, base_family = "sans") +
+  labs(x = "",
+       y = "Log2 relative abundance",
+       title = "LPC 16:0 levels at each timepoint",
+       subtitle = "m/z 1002.658, RT 3.079 min") +
+   stat_compare_means(method = "t.test", paired = TRUE) +
+   theme(legend.position = "none"))
+```
+
+```{r}
+ggsave("plots and figures/mz1002bps.svg", height = 6, width = 8)
+```
+
+##### beta-carotene
+```{r, fig.width=8, fig.height=6}
+# for Gordon conference
+(bC_bps <- justT_beta_effect_df_tidy %>% 
+   filter(mz_rt == "536.437_11.201") %>%
+  ggpaired(x = "period", y = "rel_abund_log2", fill = "treatment", 
+           line.color = "gray", 
+           line.size = 1, 
+           facet.by = "treatment", 
+           short.panel.labs = FALSE, panel.labs = list(treatment = c("Control", "High \n\u03b2-Carotene", "High \nLycopene"))) +
+  scale_fill_manual(values = c("lightgreen", 
+                               "orange",
+                               "red"),
+                    labels = c("Control",
+                               "High \u03b2-Carotene",
+                               "High Lycopene"),
+                    name = "Treatment") +
+   scale_x_discrete(labels = c("b1" = "pre",
+                               "b3" = "post")) +
+  geom_line(aes(group = subject), colour = "gray", linewidth = 0.15) +
+  theme_classic(base_size = 18, base_family = "sans") +
+  labs(x = "",
+       y = "Log2 relative abundance",
+       title = "\u03b2-Carotene levels at each timepoint") +
+   stat_compare_means(method = "t.test", paired = TRUE) +
+   theme(legend.position = "none"))
+```
+
+
+
+##### bC and 1002
+
+```{r, fig.width=12, fig.height=8}
+bC_bps + mz1002_bps + plot_layout(axes = "collect")
+```
+
+```{r}
+ggsave("plots and figures/bCandLPC16-bps.svg", height = 6, width = 12)
+```
+
+
+##### 1002 investigations
+
+```{r, fig.width=8, fig.height=6}
+df_for_stats$period <- factor(df_for_stats$period,
+                              levels = c("b1", "b3"))
+
+df_for_stats %>% 
+   filter(mz_rt == "496.342_3.082") %>%
+  ggpaired(x = "period", y = "rel_abund_log2", fill = "treatment", 
+           line.color = "gray", 
+           line.size = 1, 
+           facet.by = "treatment", 
+           short.panel.labs = FALSE, panel.labs = list(treatment = c("Control", "High \n\u03b2-Carotene", "High \nLycopene"))) +
+  scale_fill_manual(values = c("lightgreen", 
+                               "orange",
+                               "red"),
+                    labels = c("Control",
+                               "High \u03b2-Carotene",
+                               "High Lycopene"),
+                    name = "Treatment") +
+   scale_x_discrete(labels = c("b1" = "pre",
+                               "b3" = "post")) +
+  geom_line(aes(group = subject), colour = "gray", linewidth = 0.15) +
+  theme_classic(base_size = 18, base_family = "sans") +
+  labs(x = "",
+       y = "Log2 relative abundance",
+       title = "	
+496.342_3.082 levels at each timepoint") +
+   stat_compare_means(method = "t.test", paired = TRUE) +
+   theme(legend.position = "none")
+```
+
+*I am plotting this mass because I believe it is LPC 16:0, which is what I believe m/z 1002 is an adduct for. These levels (for m/z 496) are unchanging, but when you look at the chromatograms, this mass is oversaturated and may be outside of range of linearity, possibly the reason why this mass doesn't seem to change*
+
+Next, we'll look at 991 which is likely the the dimer form of m/z 496
+
+991.6743_3.082
+
+```{r, fig.width=8, fig.height=6}
+df_for_stats %>% 
+   filter(mz_rt == "991.6743_3.082") %>%
+  ggpaired(x = "period", y = "rel_abund_log2", fill = "treatment", 
+           line.color = "gray", 
+           line.size = 1, 
+           facet.by = "treatment", 
+           short.panel.labs = FALSE, panel.labs = list(treatment = c("Control", "High \n\u03b2-Carotene", "High \nLycopene"))) +
+  scale_fill_manual(values = c("lightgreen", 
+                               "orange",
+                               "red"),
+                    labels = c("Control",
+                               "High \u03b2-Carotene",
+                               "High Lycopene"),
+                    name = "Treatment") +
+   scale_x_discrete(labels = c("b1" = "pre",
+                               "b3" = "post")) +
+  geom_line(aes(group = subject), colour = "gray", linewidth = 0.15) +
+  theme_classic(base_size = 18, base_family = "sans") +
+  labs(x = "",
+       y = "Log2 relative abundance",
+       title = "	
+991.6743_3.082 levels at each timepoint") +
+   stat_compare_means(method = "t.test", paired = TRUE) +
+   theme(legend.position = "none")
+```
+
+
+```{r, fig.width=8, fig.height=6}
+df_for_stats %>% 
+   filter(mz_rt == "498.346_3.082") %>%
+  ggpaired(x = "period", y = "rel_abund_log2", fill = "treatment", 
+           line.color = "gray", 
+           line.size = 1, 
+           facet.by = "treatment", 
+           short.panel.labs = FALSE, panel.labs = list(treatment = c("Control", "High \n\u03b2-Carotene", "High \nLycopene"))) +
+  scale_fill_manual(values = c("lightgreen", 
+                               "orange",
+                               "red"),
+                    labels = c("Control",
+                               "High \u03b2-Carotene",
+                               "High Lycopene"),
+                    name = "Treatment") +
+   scale_x_discrete(labels = c("b1" = "pre",
+                               "b3" = "post")) +
+  geom_line(aes(group = subject), colour = "gray", linewidth = 0.15) +
+  theme_classic(base_size = 18, base_family = "sans") +
+  labs(x = "",
+       y = "Log2 relative abundance",
+       title = "	
+498.346_3.082 levels at each timepoint") +
+   stat_compare_means(method = "t.test", paired = TRUE) +
+   theme(legend.position = "none")
+```
+
+
+```{r}
+cor(x = df_for_stats_wide$`496.342_3.082`, y = df_for_stats_wide$`1002.658_3.079`)
+```
+
+```{r}
+cor(x = df_for_stats_wide$`991.6743_3.082`, y = df_for_stats_wide$`1002.658_3.079`)
+```
+
+```{r}
+cor(x = df_for_stats_wide$`991.6743_3.082`, y = df_for_stats_wide$`1002.658_3.079`)
+```
+
+
+##### 835 investigation
+
+Here, I'm trying to see if m/z 835 is really the C14 isotopologue of m.z 833. Let's look to see if trends are similar.
+
+```{r, fig.width=8, fig.height=12}
+df_for_stats %>% 
+   filter(mz_rt %in% c("833.6507_8.971", "835.6566_8.968")) %>%
+  ggpaired(x = "period", y = "rel_abund_log2", fill = "treatment", 
+           line.color = "gray", 
+           line.size = 1, 
+           facet.by = c("treatment", "mz_rt"), 
+           short.panel.labs = FALSE, panel.labs = list(treatment = c("Control", "High \n\u03b2-Carotene", "High \nLycopene"))) +
+  scale_fill_manual(values = c("lightgreen", 
+                               "orange",
+                               "red"),
+                    labels = c("Control",
+                               "High \u03b2-Carotene",
+                               "High Lycopene"),
+                    name = "Treatment") +
+   scale_x_discrete(labels = c("b1" = "pre",
+                               "b3" = "post")) +
+  geom_line(aes(group = subject), colour = "gray", linewidth = 0.15) +
+  theme_classic(base_size = 18, base_family = "sans") +
+  labs(x = "",
+       y = "Log2 relative abundance",
+       title = "	
+833.6507_8.971, 835.6566_8.968 levels at each timepoint") +
+   stat_compare_means(method = "t.test", paired = TRUE) +
+   theme(legend.position = "none")
+```
+
+
+```{r}
+
+cor(df_for_stats_wide$`833.6507_8.971`, df_for_stats_wide$`835.6566_8.968`)
+```
+
+These definitely should have been clustered!
+
+### Red effects
+
+```{r}
+dim(sig_paired_red_rmBG)
+```
+
+```{r}
+# select features that are only significant post red v. post control comparison
+
+overall_red_effect <- semi_join(sig_paired_red_rmBG,
+                                 sig_red_v_ctrl_t.test,
+                                  by = "mz_rt")
+dim(overall_red_effect)
+```
+
+```{r}
+# select features that are only significant post tomato v. post control comparison
+
+overall_unique_red_effect <- left_join(overall_red_effect,
+                                        sig_beta_v_red_t.test,
+                                        by = "mz_rt")
+dim(overall_unique_red_effect)
+head(overall_unique_red_effect)
+```
+
+#### Summary stats
+
+```{r}
+(FC_red_effect <- df_for_stats %>%
+  filter(mz_rt %in% overall_red_effect$mz_rt) %>%
+  select(subject, treatment_period, mz_rt, rel_abund) %>%
+  group_by(mz_rt) %>%
+  pivot_wider(names_from = treatment_period,
+              values_from = rel_abund) %>%
+  mutate(control_FC = control_b3/control_b1,
+         beta_FC = beta_b3/beta_b1,
+         red_FC = red_b3/red_b1) %>%
+  summarize(mean_control_FC = mean(control_FC, na.rm = TRUE),
+            mean_beta_FC = mean(beta_FC, na.rm = TRUE),
+            mean_red_FC = mean(red_FC, na.rm = TRUE),
+            mean_ctrl_beta_FC = mean(mean(beta_FC, na.rm = TRUE)/mean(control_FC, na.rm = TRUE)),
+            mean_ctrl_red_FC = mean(mean(red_FC, na.rm = TRUE)/mean(control_FC, na.rm = TRUE)),
+            mean_red_beta_FC = mean(mean(beta_FC, na.rm = TRUE)/mean(red_FC, na.rm = TRUE))))
+```
+
+#### Compile list
+
+```{r}
+# combine cluster and FC info
+red_effect_list <- left_join(FC_red_effect, 
+                             cluster_features,
+                             by = "mz_rt") %>%
+  select(mz_rt, mz, rt, Cluster_ID, Cluster_features, Cluster_size, everything())
+
+
+```
+
+```{r}
+# add in averages for each group + timepoint
+red_effect_list <-
+  left_join(red_effect_list,
+            (df_for_stats %>%
+               group_by(treatment_period, mz_rt) %>%
+               summarize(mean_rel_abund = mean(rel_abund)) %>%
+               pivot_wider(names_from = treatment_period, values_from = mean_rel_abund)),
+            by = "mz_rt")
+
+head(red_effect_list, n=1)
+```
+
+#### Export list
+
+```{r}
+write_csv(red_effect_list, "effect lists/red-effect.csv")
+```
+
+#### Boxplots
+
+```{r}
+# subset df for uniquely significant features
+justT_red_effect_df <- df_for_stats_wide %>%
+  dplyr::select(c(1:21),
+                (all_of(overall_unique_red_effect$mz_rt)))
+
+# make tidy df
+justT_red_effect_df_tidy <- justT_red_effect_df %>%
+  pivot_longer(cols = 22:ncol(.),
+               names_to = "mz_rt",
+               values_to = "rel_abund_log2")
+```
+
+```{r}
+# fix factor levels for time points
+justT_red_effect_df_tidy$treatment_period <- factor(justT_red_effect_df_tidy$treatment_period,
+                              levels = c("control_b1", "control_b3", 
+                                         "beta_b1", "beta_b3",
+                                         "red_b1", "red_b3"))
+
+# check
+levels(justT_red_effect_df_tidy$treatment_period)  
+
+justT_red_effect_df_tidy$treatment <- factor(justT_red_effect_df_tidy$treatment,
+                              levels = c("control", "beta", "red"))
+
+levels(justT_red_effect_df_tidy$treatment)
+
+justT_red_effect_df_tidy$period <- factor(justT_red_effect_df_tidy$period,
+                              levels = c("b1", "b3"))
+```
+
+```{r, fig.height=12, fig.width=12, fig.asp=0.5}
+justT_red_effect_df_tidy %>% 
+  ggplot(aes(x = treatment_period, y = rel_abund_log2, fill = treatment_period)) +
+  geom_boxplot() +
+  scale_fill_manual(values = c("darkseagreen2", "darkgreen", 
+                               "tan", "orangered2",
+                               "lavenderblush3", "darkred"),
+                    labels = c("pre control", "post control",
+                               "pre beta", "post beta",
+                               "pre lyc", "post lyc")) +
+  scale_x_discrete(labels = c("", "", "", "", "", "")) +
+  geom_line(aes(group = subject, colour = subject), size = 0.2) +
+  theme_classic(base_size = 12, base_family = "sans") +
+  facet_wrap(vars(mz_rt), scales = "free_y") + 
+  stat_compare_means(comparisons = my_comparisons, method = "t.test", paired = TRUE, p.adjust.method = "BH") +
+  labs(x = "",
+       y = "Log2 transformed relative abundance",
+       title = "High lyc effect - significant when compared to control, \nsignificant pre vs post red",
+       subtitle = "FDR adj. p-values from T-tests")
+```
+
+
+##### lyc
+
+```{r, fig.width=8, fig.height=6}
+(lycbps <- justT_red_effect_df_tidy %>% 
+   filter(mz_rt == "536.437_10.971") %>%
+  ggpaired(x = "period", y = "rel_abund_log2", fill = "treatment", 
+           line.color = "gray", 
+           line.size = 1, 
+           facet.by = "treatment", 
+           short.panel.labs = FALSE, panel.labs = list(treatment = c("Control", "High \n\u03b2-Carotene", "High \nLycopene"))) +
+  scale_fill_manual(values = c("lightgreen", 
+                               "orange",
+                               "red"),
+                    labels = c("Control",
+                               "High \u03b2-Carotene",
+                               "High Lycopene"),
+                    name = "Treatment") +
+   scale_x_discrete(labels = c("b1" = "pre",
+                               "b3" = "post")) +
+  geom_line(aes(group = subject), colour = "gray", linewidth = 0.15) +
+  theme_classic(base_size = 18, base_family = "sans") +
+  labs(x = "",
+       y = "Log2 relative abundance",
+       title = "	
+Lycopene levels at each timepoint") +
+   stat_compare_means(method = "t.test", paired = TRUE) +
+   theme(legend.position = "none"))
+```
+
+##### m/z760
+
+```{r, fig.width=8, fig.height=6}
+(mz760bps <- justT_red_effect_df_tidy %>% 
+   filter(mz_rt == "760.4925_6.98") %>%
+  ggpaired(x = "period", y = "rel_abund_log2", fill = "treatment", 
+           line.color = "gray", 
+           line.size = 1, 
+           facet.by = "treatment", 
+           short.panel.labs = FALSE, panel.labs = list(treatment = c("Control", "High \n\u03b2-Carotene", "High \nLycopene"))) +
+  scale_fill_manual(values = c("lightgreen", 
+                               "orange",
+                               "red"),
+                    labels = c("Control",
+                               "High \u03b2-Carotene",
+                               "High Lycopene"),
+                    name = "Treatment") +
+   scale_x_discrete(labels = c("b1" = "pre",
+                               "b3" = "post")) +
+  geom_line(aes(group = subject), colour = "gray", linewidth = 0.15) +
+  theme_classic(base_size = 18, base_family = "sans") +
+  labs(x = "",
+       y = "Log2 relative abundance",
+       title = "PC levels at each timepoint",
+       subtitle = "m/z 760.4925, RT 6.98 min.") +
+   stat_compare_means(method = "t.test", paired = TRUE) +
+   theme(legend.position = "none"))
+```
+
+##### lyc + m/z760
+
+```{r, fig.width=12, fig.height=8}
+lycbps + mz760bps + plot_layout(axes = "collect")
+```
+
+```{r}
+ggsave("plots and figures/LYCandmz760-bps.svg", height = 8, width = 12)
+```
+
+##### 760 investigation
+
+This feature seems to be getting massed by another mass (760.5281). Let's see if the levels are comparable
+
+```{r, fig.width=8, fig.height=6}
+df_for_stats %>% 
+   filter(mz_rt == "760.5281_6.984") %>%
+  ggpaired(x = "period", y = "rel_abund_log2", fill = "treatment", 
+           line.color = "gray", 
+           line.size = 1, 
+           facet.by = "treatment", 
+           short.panel.labs = FALSE, panel.labs = list(treatment = c("Control", "High \n\u03b2-Carotene", "High \nLycopene"))) +
+  scale_fill_manual(values = c("lightgreen", 
+                               "orange",
+                               "red"),
+                    labels = c("Control",
+                               "High \u03b2-Carotene",
+                               "High Lycopene"),
+                    name = "Treatment") +
+   scale_x_discrete(labels = c("b1" = "pre",
+                               "b3" = "post")) +
+  geom_line(aes(group = subject), colour = "gray", linewidth = 0.15) +
+  theme_classic(base_size = 18, base_family = "sans") +
+  labs(x = "",
+       y = "Log2 relative abundance",
+       title = "	
+760.5281_6.984 levels at each timepoint") +
+   stat_compare_means(method = "t.test", paired = TRUE) +
+   theme(legend.position = "none")
+```
+
+It turns out that the feature masking my compound is a c14 isotopologue of 758.5734
+
+```{r, fig.width=8, fig.height=6}
+df_for_stats %>% 
+   filter(mz_rt == "758.5734_6.982") %>%
+  ggpaired(x = "period", y = "rel_abund_log2", fill = "treatment", 
+           line.color = "gray", 
+           line.size = 1, 
+           facet.by = "treatment", 
+           short.panel.labs = FALSE, panel.labs = list(treatment = c("Control", "High \n\u03b2-Carotene", "High \nLycopene"))) +
+  scale_fill_manual(values = c("lightgreen", 
+                               "orange",
+                               "red"),
+                    labels = c("Control",
+                               "High \u03b2-Carotene",
+                               "High Lycopene"),
+                    name = "Treatment") +
+   scale_x_discrete(labels = c("b1" = "pre",
+                               "b3" = "post")) +
+  geom_line(aes(group = subject), colour = "gray", linewidth = 0.15) +
+  theme_classic(base_size = 18, base_family = "sans") +
+  labs(x = "",
+       y = "Log2 relative abundance",
+       title = "	
+758.5734_6.982 levels at each timepoint") +
+   stat_compare_means(method = "t.test", paired = TRUE) +
+   theme(legend.position = "none")
+```
+
+
+
+# Feature annotation
+
+## Wrangle
+
+```{r}
+annotated_df <- df_for_stats %>%
+  separate(col = mz_rt,
+           into = c("mz", "rt"),
+           sep = "_") %>%
+  select(mz, rt) %>%
+  unique()
+```
+
+
+```{r}
+# annotated_df <- lipidr::add_sample_annotation(annotated_df$mz)
+```
+
+
+
+# Export
+
+## Metabolite df
+
+```{r}
+write_csv(DC_imp_metabind_clust_log2_noQCs, "final-omics-df-lipidomics-pos.csv",col_names = TRUE)
+```
